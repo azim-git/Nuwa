@@ -1,0 +1,27 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Data / DB
+data/nuwa.db
+
+# Environment
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Others
+P4_PLAN.md
