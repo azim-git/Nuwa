@@ -5,7 +5,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/runs': 'http://localhost:8000',
+      "/runs": "http://localhost:8000",
+      "/candidates": "http://localhost:8000",
+      "/health": "http://localhost:8000",
     },
   },
 })

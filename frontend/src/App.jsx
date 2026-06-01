@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import "./App.css";
+import RunDetail from "./RunDetail";
+
 
 export function useRunStream(runId) {
   const [run, setRun] = useState(null);
@@ -16,6 +18,7 @@ export default function App() {
   const [runs, setRuns] = useState([]);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
+  const [selectedRunId, setSelectedRunId] = useState(null);
 
   async function loadRuns() {
     const res = await fetch("/runs");
@@ -58,14 +61,17 @@ export default function App() {
         </button>
       </header>
 
-      {loading ? (
+      {selectedRunId ? (
+        <RunDetail runId={selectedRunId}
+          onBack={() => { setSelectedRunId(null); loadRuns(); }} />
+      ) : loading ? (
         <p className="muted">loading…</p>
       ) : runs.length === 0 ? (
         <p className="muted">no runs yet — create one to verify the round trip.</p>
       ) : (
         <div className="run-grid">
           {runs.map((r) => (
-            <div className="run-card" key={r.id}>
+            <div className="run-card" key={r.id} onClick={() => setSelectedRunId(r.id)}>
               <div className="run-card-head">
                 <span className="run-id">{r.id}</span>
                 <span className="badge">{r.status}</span>
