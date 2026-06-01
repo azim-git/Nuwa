@@ -2,26 +2,24 @@ from enum import Enum
 
 
 class RunStatus(str, Enum):
-    DRAFT                      = "draft"
-    GENERATING_PILOT           = "generating_pilot"
-    AWAITING_PILOT_REVIEW      = "awaiting_pilot_review"
-    RUNNING                    = "running"
-    AWAITING_MASK_REVIEW       = "awaiting_mask_review"
-    AWAITING_CANDIDATE_REVIEW  = "awaiting_candidate_review"
-    AWAITING_EXPORT            = "awaiting_export"
-    COMPLETED                  = "completed"
-    ABORTED                    = "aborted"
-    FAILED                     = "failed"
+    DRAFT                  = "draft"
+    AWAITING_MASK_REVIEW   = "awaiting_mask_review"     # SAM3 one-shot done, regions pending approval
+    GENERATING_PILOT       = "generating_pilot"
+    AWAITING_PILOT_REVIEW  = "awaiting_pilot_review"    # a pilot candidate sits in awaiting_review
+    CONSOLIDATING          = "consolidating"            # pilot→full, distil guidance + validate threshold
+    RUNNING                = "running"                  # full phase, autonomous
+    AWAITING_EXPORT        = "awaiting_export"
+    COMPLETED              = "completed"
+    ABORTED                = "aborted"
+    FAILED                 = "failed"
 
 
 class CandidateStatus(str, Enum):
-    PENDING       = "pending"
-    ANALYZING     = "analyzing"
-    AWAITING_MASK = "awaiting_mask"
-    READY         = "ready"
-    GENERATING    = "generating"
-    EVALUATING    = "evaluating"
-    ESCALATED     = "escalated"
-    ACCEPTED      = "accepted"
-    REJECTED      = "rejected"
-    FAILED        = "failed"
+    PENDING         = "pending"
+    READY           = "ready"            # mask composited + prompt authored
+    GENERATING      = "generating"       # inpainting
+    EVALUATING      = "evaluating"
+    AWAITING_REVIEW = "awaiting_review"  # pilot only — scored, waiting on human
+    ACCEPTED        = "accepted"
+    REJECTED        = "rejected"
+    FAILED          = "failed"

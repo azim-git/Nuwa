@@ -1,6 +1,17 @@
 import { useEffect, useState } from "react";
 import "./App.css";
 
+export function useRunStream(runId) {
+  const [run, setRun] = useState(null);
+  useEffect(() => {
+    if (!runId) return;
+    const es = new EventSource(`/api/runs/${runId}/events`);  // match your Vite proxy / prod base
+    es.onmessage = (e) => setRun(JSON.parse(e.data));
+    return () => es.close();                                   // EventSource auto-reconnects on drop
+  }, [runId]);
+  return run;   // { status, progress, candidates }
+}
+
 export default function App() {
   const [runs, setRuns] = useState([]);
   const [loading, setLoading] = useState(true);
