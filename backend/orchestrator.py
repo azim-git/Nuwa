@@ -1,7 +1,7 @@
 import random
 from uuid import uuid4
 
-import database
+import database, asyncio
 import util
 import events
 from models import CandidateStatus as CS, RunStatus as RS
@@ -11,6 +11,7 @@ GATE         = {CS.AWAITING_REVIEW.value}
 TERMINAL     = {CS.ACCEPTED.value, CS.REJECTED.value, CS.FAILED.value}
 TERMINAL_RUN = {RS.COMPLETED.value, RS.ABORTED.value, RS.FAILED.value}
 
+_REFERENCE_PROMPT = "clean circuit board, no defects"
 
 def new_candidate(run: dict) -> dict:
     """Pick a defect type (least-generated) and a random subset of regions."""
@@ -68,15 +69,6 @@ def _mock_compose(run: dict, cand: dict) -> dict:
     }
 
 
-def _mock_evaluate(run: dict, cand: dict) -> dict:
-    diff   = round(random.uniform(0.30, 0.95), 2)
-    vision = round(random.uniform(0.30, 0.95), 2)
-    w = run["config"]["score_weights"]
-    combined = round(diff * w["diff"] + vision * w["vision"], 2)
-    return {"diff_score": diff, "vision_score": vision, "combined_score": combined,
-            "vision_verdict": "mock", "reason": "mock evaluation"}
-
-
 async def _accept(db, run: dict, cand: dict) -> None:
     region_map = {r["id"]: r for r in (run.get("regions") or [])}
     labels = [
@@ -115,7 +107,7 @@ async def _recent_rejection_reasons(db, run: dict, limit: int = 3) -> list[str]:
 
 # ---- one stage per call, never crosses a gate ----
 
-async def step_candidate(db, run: dict, cand: dict) -> dict:
+async def step_candidate(db, run: dict, cand: dict, *, mm, comfy, vision) -> dict:
     s = cand["status"]
 
     if s == CS.PENDING.value:                    # author prompt + composite mask
@@ -127,18 +119,29 @@ async def step_candidate(db, run: dict, cand: dict) -> dict:
             guidance = run["domain_profile"].get("prompt_guidance")
             cand["prompt"]     = _mock_author(run, cand, guidance=guidance)
             cand["adaptation"] = None
-        cand["artifacts"] = _mock_compose(run, cand)
+        source_path = await database.resolve_source_image(db, run)
+        cand["artifacts"] = await asyncio.get_running_loop().run_in_executor(None, compose_inputs, run, cand, source_path)
         cand["status"]    = CS.READY.value
 
     elif s == CS.READY.value:                    # submit inpaint
         cand["status"] = CS.GENERATING.value
 
-    elif s == CS.GENERATING.value:               # collect inpaint result
-        cand["artifacts"]["output_path"] = f"runs/{run['id']}/{cand['id']}/output.png"
+    elif s == CS.GENERATING.value:                       # clean reference (once) + defect pass
+        run_dir = RUNS_DIR / run["id"]
+        ref = _reference_path(run)
+        async with mm.use("comfyui"):
+            if not ref.exists():                         # the +1, once per run
+                src = await database.resolve_source_image(db, run)
+                rgba = await asyncio.get_running_loop().run_in_executor(
+                    None, _build_keep_all_rgba, src, str(run_dir / "reference_input.png"))
+                await comfy.inpaint(rgba, _REFERENCE_PROMPT, str(ref))
+            out_path = str(run_dir / cand["id"] / "output.png")
+            await comfy.inpaint(cand["artifacts"]["input_path"], cand["prompt"], out_path)
+        cand["artifacts"]["output_path"] = out_path
         cand["status"] = CS.EVALUATING.value
 
     elif s == CS.EVALUATING.value:               # evaluate, then route BY PHASE
-        cand["evaluation"] = _mock_evaluate(run, cand)
+        cand["evaluation"] = await _evaluate(db, run, cand, mm, vision)
         if cand["phase"] == "pilot":
             cand["status"] = CS.AWAITING_REVIEW.value      # human decides; scores advisory
             await database.update_candidate(db, cand)
@@ -242,7 +245,7 @@ async def run_consolidation(db, run: dict) -> None:
     await database.update_run(db, run)
 
 
-async def advance(db, run: dict) -> bool:
+async def advance(db, run: dict, *, mm, comfy, vision) -> bool:
     """One unit of work. Returns True if it progressed, False if gated/terminal."""
     status = run["status"]
 
@@ -261,6 +264,130 @@ async def advance(db, run: dict) -> bool:
         await sync_run(db, run)
         return True
 
-    await step_candidate(db, run, cand)        # pilot evaluate parks → next sync gates the loop
+    await step_candidate(db, run, cand, mm=mm, comfy=comfy, vision=vision)
     await sync_run(db, run)
     return True
+
+
+from pathlib import Path
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+RUNS_DIR = DATA_DIR / "runs"
+
+def masks_to_regions(run: dict, masks: list) -> list[dict]:
+    """SAM3 binary masks → region pool, writing one PNG per via (white via on black)."""
+    import numpy as np
+    from PIL import Image
+    masks_dir = DATA_DIR / "runs" / run["id"] / "masks"
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    regions, idx = [], 0
+    for m in masks:
+        ys, xs = np.where(m > 0)
+        if xs.size == 0:
+            continue                                   # skip empty mask
+        x0, y0 = int(xs.min()), int(ys.min())
+        rid = f"reg_{idx:03d}"
+        mask_path = masks_dir / f"{rid}.png"
+        Image.fromarray(m).save(mask_path)             # PoC convention: white=via
+        regions.append({
+            "id": rid,
+            "bbox": [x0, y0, int(xs.max() - x0 + 1), int(ys.max() - y0 + 1)],
+            "mask_path": str(mask_path),
+            "via_count": 1,
+        })
+        idx += 1
+    return regions
+
+
+def compose_inputs(run: dict, cand: dict, source_path: str) -> dict:
+    """OR-combine the candidate's region masks → dilate → invert → RGBA alpha.
+    Writes source.png + composite_mask.png; returns the artifacts dict."""
+    import numpy as np, cv2
+    from PIL import Image
+
+    out_dir = RUNS_DIR / run["id"] / cand["id"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    src = Image.open(source_path).convert("RGB")
+    W, H = src.size
+    region_map = {r["id"]: r for r in (run.get("regions") or [])}
+
+    union = np.zeros((H, W), dtype=np.uint8)            # white = via, per PoC masks
+    for rid in cand["region_ids"]:
+        m = np.array(Image.open(region_map[rid]["mask_path"]).convert("L"))
+        if m.shape != (H, W):
+            m = np.array(Image.fromarray(m).resize((W, H), Image.NEAREST))
+        union = np.maximum(union, m)
+
+    px = run["domain_profile"]["dilation_px"]           # compose-time, from the profile
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (px * 2 + 1, px * 2 + 1))
+    dilated = cv2.dilate(union, kernel, iterations=1)
+    alpha = cv2.bitwise_not(dilated)                    # ComfyUI: white=keep, black=inpaint
+
+    source_out = out_dir / "source.png"
+    mask_out   = out_dir / "composite_mask.png"
+    rgba_out   = out_dir / "rgba_input.png"
+    src.save(source_out)
+    Image.fromarray(alpha, mode="L").save(mask_out)
+    rgba = src.convert("RGBA"); rgba.putalpha(Image.fromarray(alpha, mode="L"))
+    rgba.save(rgba_out)
+
+    return {"input_path": str(rgba_out), "mask_path": str(mask_out),
+            "output_path": None, "source_path": str(source_out)}
+
+
+DIFF_GAIN = 1.0   # placeholder — calibrate from real diffs (see below)
+
+def _diff_score(output_path: str, reference_path: str, mask_path: str) -> float:
+    """Mean inpaint-vs-inpaint difference inside the defect region, normalised."""
+    from PIL import Image, ImageChops
+    import numpy as np
+    out = Image.open(output_path).convert("RGB")
+    ref = Image.open(reference_path).convert("RGB")
+    w, h = min(out.width, ref.width), min(out.height, ref.height)
+    out, ref = out.crop((0, 0, w, h)), ref.crop((0, 0, w, h))     # per your PoC
+
+    diff = np.asarray(ImageChops.difference(out, ref), dtype=np.float32).mean(axis=2)
+    mask = np.asarray(Image.open(mask_path).convert("L").resize((w, h), Image.NEAREST))
+    region = mask < 128                                           # black = inpaint area
+    if region.sum() == 0:
+        return 0.0
+    raw = float(diff[region].mean()) / 255.0
+    return round(min(1.0, raw * DIFF_GAIN), 4)
+
+
+def _union_bbox(boxes):
+    x0 = min(b[0] for b in boxes); y0 = min(b[1] for b in boxes)
+    x1 = max(b[0] + b[2] for b in boxes); y1 = max(b[1] + b[3] for b in boxes)
+    return [x0, y0, x1 - x0, y1 - y0]
+
+
+async def _evaluate(db, run, cand, mm, vision) -> dict:
+    ref = _reference_path(run)
+    diff = None
+    if ref.exists():
+        diff = await asyncio.get_running_loop().run_in_executor(
+            None, _diff_score, cand["artifacts"]["output_path"],
+            str(ref), cand["artifacts"]["mask_path"])
+
+    rmap = {r["id"]: r for r in (run.get("regions") or [])}
+    boxes = [rmap[rid]["bbox"] for rid in cand["region_ids"] if rid in rmap]
+    async with mm.use("vision"):                          # frees ComfyUI first
+        v = await vision.score(cand["artifacts"]["output_path"], cand["defect_type"],
+                               run["domain_profile"]["eval_rubric"], _union_bbox(boxes))
+
+    w = run["config"]["score_weights"]
+    combined = round((diff or 0.0) * w["diff"] + v["vision_score"] * w["vision"], 2)
+    return {"diff_score": diff, "vision_score": v["vision_score"], "combined_score": combined,
+            "vision_verdict": v["vision_verdict"], "reason": v["reason"]}
+
+
+def _build_keep_all_rgba(source_path: str, out_path: str) -> str:
+    from PIL import Image
+    img = Image.open(source_path).convert("RGB").convert("RGBA")
+    img.putalpha(255)                                   # all-white alpha = keep everything
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path)
+    return out_path
+
+def _reference_path(run: dict) -> Path:
+    return RUNS_DIR / run["id"] / "reference.png"

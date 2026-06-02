@@ -9,6 +9,7 @@ const client = axios.create({ baseURL: BASE_URL, timeout: 30000 })
 export async function listRuns()            { return (await client.get("/runs")).data }
 export async function getRun(runId)         { return (await client.get(`/runs/${runId}`)).data }
 export async function getCandidates(runId)  { return (await client.get(`/runs/${runId}/candidates`)).data }
+export async function getSource(imageId)    { return (await client.get(`/sources/${imageId}`)).data }
 
 // ── Commands (fire-and-forget — do NOT render the return value) ──────
 export async function createRun(config) {

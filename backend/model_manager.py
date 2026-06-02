@@ -15,10 +15,12 @@ class ModelManager:
 
     def __init__(self) -> None:
         self._resident: str | None = None
+        self._teardowns: dict = {}                # consumer -> async unload fn
 
-    @property
-    def resident(self) -> str | None:
-        return self._resident
+    def register(self, consumer: str, teardown) -> None:
+        if consumer not in CONSUMERS:
+            raise ValueError(f"unknown GPU consumer: {consumer}")
+        self._teardowns[consumer] = teardown
 
     @asynccontextmanager
     async def use(self, consumer: str):
@@ -36,8 +38,7 @@ class ModelManager:
             self._resident = None
 
     async def _free(self, consumer: str) -> None:
-        # STUB — Track 3 fills real teardown per consumer:
-        #   agent / vision -> `ollama stop <model>`
-        #   sam3           -> del model; torch.cuda.empty_cache()
-        #   comfyui        -> POST /free (unload models, keep process)
+        fn = self._teardowns.get(consumer)
+        if fn:
+            await fn()                            # consumer owns its own teardown
         logger.info("freeing GPU held by %s (stub)", consumer)

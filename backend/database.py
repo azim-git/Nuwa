@@ -209,3 +209,38 @@ async def insert_dataset_entry(db: aiosqlite.Connection, e: dict) -> None:
          _dump(e["bbox"]), e["split"], e["image_path"]),
     )
     await db.commit()
+
+
+    # ── Source image helpers ──────────────────────────────────────────────
+
+
+async def insert_source_image(db, img: dict) -> None:
+    await db.execute(
+        """INSERT INTO source_images (id, path, width, height, uploaded_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (img["id"], img["path"], img["width"], img["height"], img["uploaded_at"]),
+    )
+    await db.commit()
+
+
+async def get_source_image(db, image_id: str) -> dict | None:
+    cur = await db.execute("SELECT * FROM source_images WHERE id = ?", (image_id,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def list_source_images(db) -> list[dict]:
+    cur = await db.execute("SELECT * FROM source_images ORDER BY uploaded_at DESC")
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def resolve_source_image(db, run: dict) -> str:
+    """On-disk path of a run's primary source image.
+    Raises ValueError if unset/missing — callers translate (HTTP vs loop)."""
+    ids = run["config"].get("source_image_ids") or []
+    if not ids:
+        raise ValueError("run has no source_image_ids")
+    img = await get_source_image(db, ids[0])
+    if img is None:
+        raise ValueError(f"source image {ids[0]} not found")
+    return img["path"]

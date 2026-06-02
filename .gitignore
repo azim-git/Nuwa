@@ -9,7 +9,7 @@ frontend/node_modules/
 frontend/dist/
 
 # Data / DB
-data/nuwa.db
+data/
 
 # Environment
 .env
@@ -26,3 +26,5 @@ Thumbs.db
 # Others
 P4_PLAN.md
 P4_PLAN(old).md
+models/
+pcb_regular_resized.png

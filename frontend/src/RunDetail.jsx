@@ -1,7 +1,7 @@
 // src/RunDetail.jsx
 import { useEffect, useState } from "react"
 import { useRunStream } from "./useRunStream"
-import { getRun, detect, approveMask, abortRun, decideCandidate } from "./api"
+import { getRun, getSource, detect, approveMask, abortRun, decideCandidate, BASE_URL } from "./api"
 
 export default function RunDetail({ runId, onBack }) {
   const { snapshot, connected } = useRunStream(runId)
@@ -10,7 +10,7 @@ export default function RunDetail({ runId, onBack }) {
 
   useEffect(() => {
     if (!runId) return
-    getRun(runId).then((r) => setConfig(r.config)).catch(() => {})
+    getRun(runId).then((r) => setConfig(r.config)).catch(() => { })
   }, [runId])
 
   if (!snapshot) {
@@ -50,7 +50,7 @@ export default function RunDetail({ runId, onBack }) {
       )}
 
       <ProgressBar accepted={progress.accepted} rejected={progress.rejected}
-                   goal={goal} phase={progress.phase} />
+        goal={goal} phase={progress.phase} />
 
       <StatusGate
         status={status} busy={busy} runId={runId}
@@ -59,8 +59,8 @@ export default function RunDetail({ runId, onBack }) {
         onApproveSubset={(ids) => cmd(() => approveMask(runId, ids))}
         onAbort={() => cmd(() => abortRun(runId))}
         onDecide={(decision, reason) =>
-            reviewCandidate && cmd(() => decideCandidate(reviewCandidate.id, decision, reason))}
-        />
+          reviewCandidate && cmd(() => decideCandidate(reviewCandidate.id, decision, reason))}
+      />
 
       <CandidateFeed candidates={candidates} />
     </div>
@@ -75,15 +75,17 @@ function ProgressBar({ accepted, rejected, goal, phase }) {
         {phase} · accepted {accepted}/{goal} · rejected {rejected}
       </div>
       <div style={{ height: 6, background: "#eee", borderRadius: 6 }}>
-        <div style={{ height: 6, width: `${pct}%`, background: "#111",
-                      borderRadius: 6, transition: "width .2s" }} />
+        <div style={{
+          height: 6, width: `${pct}%`, background: "#111",
+          borderRadius: 6, transition: "width .2s"
+        }} />
       </div>
     </div>
   )
 }
 
-function StatusGate({ status, busy, runId, reviewCandidate, onDetect, onApproveSubset, onAbort, onDecide }) { 
-    switch (status) {
+function StatusGate({ status, busy, runId, reviewCandidate, onDetect, onApproveSubset, onAbort, onDecide }) {
+  switch (status) {
     case "draft":
       return <button className="btn-primary" disabled={busy} onClick={onDetect}>
         {busy ? "detecting…" : "detect regions (SAM3)"}</button>
@@ -147,13 +149,23 @@ function PilotReviewCard({ candidate, busy, onDecide }) {
         <span className="muted" style={{ marginLeft: "auto", fontSize: 12 }}>{candidate.id}</span>
       </div>
 
-      {/* Track 3: replace with <img src={artifactUrl(candidate.artifacts.output_path)} /> */}
-      <div className="muted" style={{
-        height: 220, margin: "12px 0", borderRadius: 6, background: "#f4f4f4",
-        display: "grid", placeItems: "center", fontSize: 12, textAlign: "center", padding: 8,
-      }}>
-        generated image — served in Track 3<br />{candidate.artifacts?.output_path}
-      </div>
+      {candidate.artifacts?.output_path ? (
+        <img
+          src={`${BASE_URL}/runs/${candidate.run_id}/candidates/${candidate.id}/artifact/output`}
+          alt="generated defect candidate"
+          style={{
+            width: "100%", objectFit: "contain",
+            margin: "12px 0", borderRadius: 6, background: "#f4f4f4"
+          }}
+        />
+      ) : (
+        <div className="muted" style={{
+          height: 220, margin: "12px 0", borderRadius: 6,
+          background: "#f4f4f4", display: "grid", placeItems: "center"
+        }}>
+          awaiting generation…
+        </div>
+      )}
 
       {ev && (
         <div className="muted" style={{ fontSize: 13 }}>
@@ -186,8 +198,8 @@ function PilotReviewCard({ candidate, busy, onDecide }) {
           {busy ? "…" : "accept → dataset"}
         </button>
         <button className="link" disabled={busy || !canReject}
-                onClick={() => onDecide("reject", reason.trim())}
-                title={canReject ? "" : "a reason is required to reject"}>
+          onClick={() => onDecide("reject", reason.trim())}
+          title={canReject ? "" : "a reason is required to reject"}>
           {busy ? "…" : "reject"}
         </button>
       </div>
@@ -198,17 +210,24 @@ function PilotReviewCard({ candidate, busy, onDecide }) {
 function MaskReviewCard({ runId, busy, onApprove }) {
   const [regions, setRegions] = useState(null)
   const [kept, setKept] = useState(() => new Set())
+  const [source, setSource] = useState(null)       // { id, width, height }
 
   useEffect(() => {
-    // regions aren't in the snapshot — fetch the full run for the pool
     getRun(runId)
-      .then((r) => {
+      .then(async (r) => {
         const regs = r.regions || []
         setRegions(regs)
-        setKept(new Set(regs.map((x) => x.id)))   // default: keep all
+        setKept(new Set(regs.map((x) => x.id)))
+        const srcId = r.config?.source_image_ids?.[0]
+        if (srcId) {
+          const meta = await getSource(srcId)
+          setSource({ id: srcId, width: meta.width, height: meta.height })
+        }
       })
       .catch(() => setRegions([]))
   }, [runId])
+
+  const sourceUrl = source?.id ? `${BASE_URL}/sources/${source.id}/file` : null
 
   if (regions === null) return <div className="muted">loading detected regions…</div>
   if (regions.length === 0) return <div className="muted">no regions detected.</div>
@@ -221,11 +240,8 @@ function MaskReviewCard({ runId, busy, onApprove }) {
     })
   }
 
-  // viewBox = source-image space (origin 0,0). Track 3: set vbW/vbH to true
-  // source dimensions and add <image href={sourceUrl} .../> as the background.
-  const pad = 20
-  const vbW = Math.max(...regions.map((r) => r.bbox[0] + r.bbox[2])) + pad
-  const vbH = Math.max(...regions.map((r) => r.bbox[1] + r.bbox[3])) + pad
+  const vbW = source?.width || Math.max(...regions.map((r) => r.bbox[0] + r.bbox[2])) + 20
+  const vbH = source?.height || Math.max(...regions.map((r) => r.bbox[1] + r.bbox[3])) + 20
   const keptCount = kept.size
 
   return (
@@ -240,20 +256,27 @@ function MaskReviewCard({ runId, busy, onApprove }) {
       </div>
 
       <svg viewBox={`0 0 ${vbW} ${vbH}`}
-           style={{ width: "100%", marginTop: 12, background: "#f4f4f4", borderRadius: 6 }}>
-        {/* Track 3: <image href={sourceUrl} x="0" y="0" width={vbW} height={vbH} /> */}
+        style={{ width: "100%", marginTop: 12, background: "#f4f4f4", borderRadius: 6 }}>
+        {sourceUrl && <image href={sourceUrl} x="0" y="0" width={vbW} height={vbH}
+          preserveAspectRatio="none" />}
         {regions.map((r) => {
           const on = kept.has(r.id)
           const [x, y, w, h] = r.bbox
           return (
             <g key={r.id} onClick={() => toggle(r.id)} style={{ cursor: "pointer" }}>
+              {/* black outline for contrast on any background */}
               <rect x={x} y={y} width={w} height={h}
-                    fill={on ? "rgba(22,163,74,0.25)" : "transparent"}
-                    stroke={on ? "#16a34a" : "#bbb"}
-                    strokeWidth={on ? 2 : 1}
-                    strokeDasharray={on ? "0" : "4 3"} />
-              <text x={x + 2} y={Math.max(8, y - 3)} fontSize="10"
-                    fill={on ? "#16a34a" : "#999"}>{r.id}</text>
+                fill="none" stroke="#000" strokeWidth={4} strokeOpacity={0.5} />
+              <rect x={x} y={y} width={w} height={h}
+                fill={on ? "rgba(0,255,120,0.18)" : "rgba(255,0,0,0.10)"}
+                stroke={on ? "#00ff78" : "#ff4444"}
+                strokeWidth={2}
+                strokeDasharray={on ? "0" : "6 4"} />
+              {/* label background for readability */}
+              <rect x={x} y={Math.max(0, y - 16)} width={r.id.length * 7 + 6} height={14}
+                rx={2} fill="rgba(0,0,0,0.65)" />
+              <text x={x + 3} y={Math.max(11, y - 5)} fontSize="11" fontWeight="bold"
+                fill={on ? "#00ff78" : "#ff6666"}>{r.id}</text>
             </g>
           )
         })}
@@ -265,9 +288,9 @@ function MaskReviewCard({ runId, busy, onApprove }) {
       </div>
 
       <button className="btn-primary" style={{ marginTop: 12 }}
-              disabled={busy || keptCount === 0}
-              title={keptCount === 0 ? "keep at least one region" : ""}
-              onClick={() => onApprove([...kept])}>
+        disabled={busy || keptCount === 0}
+        title={keptCount === 0 ? "keep at least one region" : ""}
+        onClick={() => onApprove([...kept])}>
         {busy ? "approving…" : `approve ${keptCount} region(s) → start pilot`}
       </button>
     </div>

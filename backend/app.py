@@ -1,8 +1,11 @@
 from contextlib import asynccontextmanager
 from uuid import uuid4
 import asyncio
+from dotenv import load_dotenv
+load_dotenv()  # load backend/.env before anything reads os.environ
 
 import json
+from src.sam3.client import Sam3Client
 import events
 from fastapi import Request
 from fastapi.responses import StreamingResponse
@@ -17,6 +20,12 @@ from src.agent.derive_profile import derive_domain_profile
 from util import utcnow_iso
 from model_manager import ModelManager
 from src.comfy.client import ComfyUIClient
+from src.vision.client import VisionClient
+
+from fastapi import UploadFile, File
+from fastapi.responses import FileResponse
+from PIL import Image
+from pathlib import Path
 
 
 class DefectsPerImage(BaseModel):
@@ -36,7 +45,7 @@ class ScoreWeights(BaseModel):
 
 
 class Thresholds(BaseModel):
-    auto_accept_above: float = 0.80
+    auto_accept_above: float = 0.50
     auto_reject_below: float = 0.45
 
 
@@ -45,8 +54,8 @@ class RunConfig(BaseModel):
     dataset_description: str
     defect_taxonomy: list[str] = ["scratch", "crack"]#Field(min_length=1)
     eval_prompt: str
-    pilot_count: int = 1 #5
-    target_count: int = 10 #30
+    pilot_count: int = 2 #5
+    target_count: int = 5 #30
     gates: Gates = Field(default_factory=Gates)
     score_weights: ScoreWeights = Field(default_factory=ScoreWeights)
     thresholds: Thresholds = Field(default_factory=Thresholds)
@@ -68,7 +77,16 @@ async def lifespan(app: FastAPI):
     app.state.db = await database.connect()
     await database.init_db(app.state.db)
     app.state.mm = ModelManager()
+
+    app.state.sam3 = Sam3Client()
+    app.state.mm.register("sam3", app.state.sam3.unload)
+
     app.state.comfy = ComfyUIClient()
+    app.state.mm.register("comfyui", app.state.comfy.unload)
+
+    app.state.vision = VisionClient()
+    app.state.mm.register("vision", app.state.vision.unload)
+
     app.state.tasks = {}
 
     for run in await database.list_runs(app.state.db):     # restart-resume
@@ -90,7 +108,7 @@ async def _run_loop(run_id: str):
             run = await database.get_run(db, run_id)
             if run is None:
                 break
-            if not await orchestrator.advance(db, run):
+            if not await orchestrator.advance(db, run, mm=app.state.mm, comfy=app.state.comfy, vision=app.state.vision):
                 break
             await asyncio.sleep(orchestrator.LOOP_DELAY)
     finally:
@@ -186,11 +204,19 @@ async def run_events(run_id: str, request: Request):
 @app.post("/runs/{run_id}/detect")
 async def detect(run_id: str):
     run = await database.get_run(app.state.db, run_id)
-    if run is None:
-        raise HTTPException(404, "run not found")
+    if run is None: raise HTTPException(404, "run not found")
     if run["status"] != RunStatus.DRAFT.value:
         raise HTTPException(409, f"can only detect from draft (is {run['status']})")
-    run["regions"] = orchestrator._mock_detect_regions(run)   # Track 3: real SAM3, one-shot
+    p = run["domain_profile"]
+    try:
+        image_path = await database.resolve_source_image(app.state.db, run)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    async with app.state.mm.use("sam3"):
+        masks = await app.state.sam3.detect(image_path, p["mask_prompt"], p["mask_conf"])
+        run["regions"] = await asyncio.get_running_loop().run_in_executor(
+            None, orchestrator.masks_to_regions, run, masks)
+    await app.state.mm.free_all()                       # next GPU use is gated behind human mask review
     run = await orchestrator.sync_run(app.state.db, run)
     return {"run_status": run["status"], "regions": run["regions"]}
 
@@ -259,6 +285,79 @@ async def get_candidates(run_id: str):
     return await database.list_candidates(app.state.db, run_id)
 
 
+_ARTIFACT_KEYS = {
+    "output": "output_path",
+    "mask":   "mask_path",
+    "input":  "input_path",
+    "source": "source_path",
+}
+
+@app.get("/runs/{run_id}/candidates/{cid}/artifact/{kind}")
+async def get_candidate_artifact(run_id: str, cid: str, kind: str):
+    key = _ARTIFACT_KEYS.get(kind)
+    if key is None:
+        raise HTTPException(404, f"unknown artifact kind: {kind}")
+    cand = await database.get_candidate(app.state.db, cid)
+    if cand is None or cand["run_id"] != run_id:
+        raise HTTPException(404, "candidate not found")
+    path = (cand.get("artifacts") or {}).get(key)
+    if not path or not Path(path).exists():
+        raise HTTPException(404, f"artifact '{kind}' not available")
+    return FileResponse(path)
+
+
+SOURCES_DIR = Path(__file__).resolve().parent.parent / "data" / "sources"
+SOURCES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.post("/sources", status_code=201)
+async def upload_source(file: UploadFile = File(...)):
+    img_id = "src_" + uuid4().hex[:8]
+    path = SOURCES_DIR / f"{img_id}{Path(file.filename or '').suffix.lower() or '.png'}"
+    path.write_bytes(await file.read())
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise HTTPException(400, "not a readable image")
+    rec = {"id": img_id, "path": str(path), "width": w, "height": h,
+           "uploaded_at": utcnow_iso()}
+    await database.insert_source_image(app.state.db, rec)
+    return rec
+
+
+@app.get("/sources")
+async def list_sources():
+    return await database.list_source_images(app.state.db)
+
+
+@app.get("/sources/{image_id}")
+async def get_source(image_id: str):
+    img = await database.get_source_image(app.state.db, image_id)
+    if img is None:
+        raise HTTPException(404, "source image not found")
+    return img
+
+
+@app.get("/sources/{image_id}/file")
+async def get_source_file(image_id: str):
+    img = await database.get_source_image(app.state.db, image_id)
+    if img is None:
+        raise HTTPException(404, "source image not found")
+    return FileResponse(img["path"])
+
+
+async def resolve_source_image(run: dict) -> str:
+    ids = run["config"].get("source_image_ids") or []
+    if not ids:
+        raise HTTPException(400, "run has no source_image_ids")
+    img = await database.get_source_image(app.state.db, ids[0])
+    if img is None:
+        raise HTTPException(404, f"source image {ids[0]} not found")
+    return img["path"]
+
+
 # --- Debug endpoints below
 
 
@@ -268,7 +367,7 @@ async def debug_step_candidate(cid: str):
     if cand is None:
         raise HTTPException(404, "candidate not found")
     run  = await database.get_run(app.state.db, cand["run_id"])
-    cand = await orchestrator.step_candidate(app.state.db, run, cand)
+    cand = await orchestrator.step_candidate(app.state.db, run, cand, mm=app.state.mm, comfy=app.state.comfy, vision=app.state.vision)
     run  = await orchestrator.sync_run(app.state.db, run)
     return {"candidate_status": cand["status"], "run_status": run["status"],
             "progress": run["progress"]}

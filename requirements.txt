@@ -63,3 +63,6 @@ ultralytics_thop==2.0.19
 urllib3==2.7.0
 wcwidth==0.7.0
 yarl==1.24.2
+python-multipart==0.0.30
+python-dotenv>=1.0.0
+ollama
