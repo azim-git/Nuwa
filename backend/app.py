@@ -21,11 +21,15 @@ from util import utcnow_iso
 from model_manager import ModelManager
 from src.comfy.client import ComfyUIClient
 from src.vision.client import VisionClient
+from src.agent.client import AgentClient
 
 from fastapi import UploadFile, File
 from fastapi.responses import FileResponse
 from PIL import Image
 from pathlib import Path
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)-20s %(levelname)s  %(message)s")
 
 
 class DefectsPerImage(BaseModel):
@@ -87,6 +91,9 @@ async def lifespan(app: FastAPI):
     app.state.vision = VisionClient()
     app.state.mm.register("vision", app.state.vision.unload)
 
+    app.state.agent = AgentClient()
+    app.state.mm.register("agent", app.state.agent.unload)
+
     app.state.tasks = {}
 
     for run in await database.list_runs(app.state.db):     # restart-resume
@@ -108,7 +115,7 @@ async def _run_loop(run_id: str):
             run = await database.get_run(db, run_id)
             if run is None:
                 break
-            if not await orchestrator.advance(db, run, mm=app.state.mm, comfy=app.state.comfy, vision=app.state.vision):
+            if not await orchestrator.advance(db, run, mm=app.state.mm, comfy=app.state.comfy, vision=app.state.vision, agent=app.state.agent):
                 break
             await asyncio.sleep(orchestrator.LOOP_DELAY)
     finally:
@@ -367,7 +374,7 @@ async def debug_step_candidate(cid: str):
     if cand is None:
         raise HTTPException(404, "candidate not found")
     run  = await database.get_run(app.state.db, cand["run_id"])
-    cand = await orchestrator.step_candidate(app.state.db, run, cand, mm=app.state.mm, comfy=app.state.comfy, vision=app.state.vision)
+    cand = await orchestrator.step_candidate(app.state.db, run, cand, mm=app.state.mm, comfy=app.state.comfy, vision=app.state.vision, agent=app.state.agent)
     run  = await orchestrator.sync_run(app.state.db, run)
     return {"candidate_status": cand["status"], "run_status": run["status"],
             "progress": run["progress"]}

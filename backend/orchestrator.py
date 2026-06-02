@@ -107,21 +107,24 @@ async def _recent_rejection_reasons(db, run: dict, limit: int = 3) -> list[str]:
 
 # ---- one stage per call, never crosses a gate ----
 
-async def step_candidate(db, run: dict, cand: dict, *, mm, comfy, vision) -> dict:
+async def step_candidate(db, run: dict, cand: dict, *, mm, comfy, vision, agent) -> dict:
     s = cand["status"]
 
-    if s == CS.PENDING.value:                    # author prompt + composite mask
-        if cand["phase"] == "pilot":
-            feedback = await _recent_rejection_reasons(db, run)
-            cand["prompt"]     = _mock_author(run, cand, feedback=feedback)
-            cand["adaptation"] = {"based_on": feedback} if feedback else None
-        else:
-            guidance = run["domain_profile"].get("prompt_guidance")
-            cand["prompt"]     = _mock_author(run, cand, guidance=guidance)
-            cand["adaptation"] = None
+    if s == CS.PENDING.value:                    # author prompt (agent) + composite mask
+        dd = run["config"]["dataset_description"]
+        async with mm.use("agent"):              # frees comfy/vision from the prior candidate
+            if cand["phase"] == "pilot":
+                feedback = await _recent_rejection_reasons(db, run)
+                cand["prompt"] = await agent.author(dd, cand["defect_type"], feedback=feedback)
+                cand["adaptation"] = {"based_on": feedback} if feedback else None
+            else:
+                guidance = run["domain_profile"].get("prompt_guidance")
+                cand["prompt"] = await agent.author(dd, cand["defect_type"], guidance=guidance)
+                cand["adaptation"] = None
         source_path = await database.resolve_source_image(db, run)
-        cand["artifacts"] = await asyncio.get_running_loop().run_in_executor(None, compose_inputs, run, cand, source_path)
-        cand["status"]    = CS.READY.value
+        cand["artifacts"] = await asyncio.get_running_loop().run_in_executor(
+            None, compose_inputs, run, cand, source_path)
+        cand["status"] = CS.READY.value
 
     elif s == CS.READY.value:                    # submit inpaint
         cand["status"] = CS.GENERATING.value
@@ -146,9 +149,10 @@ async def step_candidate(db, run: dict, cand: dict, *, mm, comfy, vision) -> dic
             cand["status"] = CS.AWAITING_REVIEW.value      # human decides; scores advisory
             await database.update_candidate(db, cand)
             return cand
-        combined = cand["evaluation"]["combined_score"]    # full phase: threshold auto-decides
-        decision = "accept" if combined >= run["config"]["thresholds"]["auto_accept_above"] else "reject"
-        await apply_decision(db, run, cand, decision, by="agent")
+        guidance  = run["domain_profile"].get("prompt_guidance") or {}
+        threshold = guidance.get("validated_threshold", run["config"]["thresholds"]["auto_accept_above"])
+        combined  = cand["evaluation"]["combined_score"]
+        await apply_decision(db, run, cand, "accept" if combined >= threshold else "reject", by="agent")
         return cand
 
     else:
@@ -225,32 +229,42 @@ async def _active_candidate(db, run: dict) -> dict | None:
     return None
 
 
-async def run_consolidation(db, run: dict) -> None:
-    """Pilot→full transition. MOCKED — Track 3 swaps in the agent LLM."""
+async def run_consolidation(db, run: dict, *, mm, agent) -> None:
+    """Pilot→full: calibrate the threshold (numeric) + distil guidance (agent), then freeze."""
     cands   = await database.list_candidates(db, run["id"])
     accepts = [c for c in cands if c["status"] == CS.ACCEPTED.value]
     rejects = [c for c in cands if c["status"] == CS.REJECTED.value and c.get("human_decision")]
-    # Real impl: cross-reference accept vs reject prompts/reasons → discriminative
-    #   guidance (negative_constraints only if a reason is in rejects AND NOT accepts),
-    #   then validate the threshold. Frozen here; full phase never revises it.
+
+    acc_scores = [c["evaluation"]["combined_score"] for c in accepts if c.get("evaluation")]
+    rej_scores = [c["evaluation"]["combined_score"] for c in rejects if c.get("evaluation")]
+    threshold  = _calibrate_threshold(acc_scores, rej_scores,
+                                       run["config"]["thresholds"]["auto_accept_above"])
+
+    acc_prompts = [c["prompt"] for c in accepts if c.get("prompt")]
+    rej_pairs   = [(c["prompt"], c["human_decision"].get("reason", ""))
+                   for c in rejects if c.get("prompt")]
+    async with mm.use("agent"):
+        guidance = await agent.consolidate(acc_prompts, rej_pairs)
+
     run["domain_profile"]["prompt_guidance"] = {
-        "positive_keywords": [],
-        "negative_constraints": [],
-        "validated_threshold": run["config"]["thresholds"]["auto_accept_above"],
+        "positive_keywords":    guidance["positive_keywords"],
+        "negative_constraints": guidance["negative_constraints"],
+        "validated_threshold":  threshold,
         "frozen": True,
-        "basis": {"accepts": len(accepts), "rejects": len(rejects)},
+        "basis": {"accepts": len(accepts), "rejects": len(rejects),
+                  "config_threshold": run["config"]["thresholds"]["auto_accept_above"]},
     }
-    run["progress"]["phase"] = "full"          # the flip that makes CONSOLIDATING non-sticky
+    run["progress"]["phase"] = "full"
     run["updated_at"] = util.utcnow_iso()
     await database.update_run(db, run)
 
 
-async def advance(db, run: dict, *, mm, comfy, vision) -> bool:
+async def advance(db, run: dict, *, mm, comfy, vision, agent) -> bool:
     """One unit of work. Returns True if it progressed, False if gated/terminal."""
     status = run["status"]
 
     if status == RS.CONSOLIDATING.value:
-        await run_consolidation(db, run)
+        await run_consolidation(db, run, mm=mm, agent=agent)
         await sync_run(db, run)                # phase is now 'full' → recomputes to RUNNING
         return True
 
@@ -264,7 +278,7 @@ async def advance(db, run: dict, *, mm, comfy, vision) -> bool:
         await sync_run(db, run)
         return True
 
-    await step_candidate(db, run, cand, mm=mm, comfy=comfy, vision=vision)
+    await step_candidate(db, run, cand, mm=mm, comfy=comfy, vision=vision, agent=agent)
     await sync_run(db, run)
     return True
 
@@ -372,8 +386,9 @@ async def _evaluate(db, run, cand, mm, vision) -> dict:
     rmap = {r["id"]: r for r in (run.get("regions") or [])}
     boxes = [rmap[rid]["bbox"] for rid in cand["region_ids"] if rid in rmap]
     async with mm.use("vision"):                          # frees ComfyUI first
-        v = await vision.score(cand["artifacts"]["output_path"], cand["defect_type"],
-                               run["domain_profile"]["eval_rubric"], _union_bbox(boxes))
+        v = await vision.score(cand["artifacts"]["output_path"],
+                               run["config"]["dataset_description"],
+                               cand["defect_type"], _union_bbox(boxes))
 
     w = run["config"]["score_weights"]
     combined = round((diff or 0.0) * w["diff"] + v["vision_score"] * w["vision"], 2)
@@ -389,5 +404,24 @@ def _build_keep_all_rgba(source_path: str, out_path: str) -> str:
     img.save(out_path)
     return out_path
 
+
 def _reference_path(run: dict) -> Path:
     return RUNS_DIR / run["id"] / "reference.png"
+
+
+def _calibrate_threshold(accept_scores, reject_scores, default):
+    """Find the combined-score bar that best reproduces the human's pilot decisions."""
+    if not accept_scores and not reject_scores:
+        return default
+    if accept_scores and not reject_scores:                 # all accepted: bar just below worst-kept
+        return round(max(0.0, min(accept_scores) - 0.02), 2)
+    if reject_scores and not accept_scores:                 # all rejected: stay strict (degenerate)
+        return round(min(1.0, max(reject_scores) + 0.05), 2)
+    pts = sorted(set(accept_scores + reject_scores))         # both present: minimise misclassification
+    cands = [pts[0] - 1e-3] + [(pts[i] + pts[i+1]) / 2 for i in range(len(pts)-1)] + [pts[-1] + 1e-3]
+    best_T, best_err = default, len(pts) + 1
+    for T in cands:
+        err = sum(s < T for s in accept_scores) + sum(s >= T for s in reject_scores)
+        if err < best_err or (err == best_err and T < best_T):   # tie → lower bar (lean accept)
+            best_err, best_T = err, T
+    return round(max(0.0, min(1.0, best_T)), 2)
