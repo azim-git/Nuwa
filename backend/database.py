@@ -211,6 +211,17 @@ async def insert_dataset_entry(db: aiosqlite.Connection, e: dict) -> None:
     await db.commit()
 
 
+async def list_dataset_entries(db: aiosqlite.Connection, run_id: str) -> list[dict]:
+    cur = await db.execute(
+        "SELECT * FROM dataset_entries WHERE run_id = ? ORDER BY candidate_id", (run_id,))
+    rows = await cur.fetchall()
+    return [{
+        "id": r["id"], "run_id": r["run_id"], "candidate_id": r["candidate_id"],
+        "category": r["category"], "bbox": _load(r["bbox"]),
+        "split": r["split"], "image_path": r["image_path"],
+    } for r in rows]
+
+
     # ── Source image helpers ──────────────────────────────────────────────
 
 

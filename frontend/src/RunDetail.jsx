@@ -1,12 +1,13 @@
 // src/RunDetail.jsx
 import { useEffect, useState } from "react"
 import { useRunStream } from "./useRunStream"
-import { getRun, getSource, detect, approveMask, abortRun, decideCandidate, BASE_URL } from "./api"
+import { getRun, getSource, detect, approveMask, abortRun, decideCandidate, exportRun, exportDownloadUrl, BASE_URL } from "./api"
 
 export default function RunDetail({ runId, onBack }) {
   const { snapshot, connected } = useRunStream(runId)
   const [config, setConfig] = useState(null)   // setup data the loop never touches
   const [busy, setBusy] = useState(false)
+  const [exportSummary, setExportSummary] = useState(null)   // from the export POST response
 
   useEffect(() => {
     if (!runId) return
@@ -55,9 +56,11 @@ export default function RunDetail({ runId, onBack }) {
       <StatusGate
         status={status} busy={busy} runId={runId}
         reviewCandidate={reviewCandidate}
+        exportSummary={exportSummary}
         onDetect={() => cmd(() => detect(runId))}
         onApproveSubset={(ids) => cmd(() => approveMask(runId, ids))}
         onAbort={() => cmd(() => abortRun(runId))}
+        onExport={() => cmd(async () => setExportSummary((await exportRun(runId)).export))}
         onDecide={(decision, reason) =>
           reviewCandidate && cmd(() => decideCandidate(reviewCandidate.id, decision, reason))}
       />
@@ -84,7 +87,7 @@ function ProgressBar({ accepted, rejected, goal, phase }) {
   )
 }
 
-function StatusGate({ status, busy, runId, reviewCandidate, onDetect, onApproveSubset, onAbort, onDecide }) {
+function StatusGate({ status, busy, runId, reviewCandidate, exportSummary, onDetect, onApproveSubset, onAbort, onExport, onDecide }) {
   switch (status) {
     case "draft":
       return <button className="btn-primary" disabled={busy} onClick={onDetect}>
@@ -100,8 +103,18 @@ function StatusGate({ status, busy, runId, reviewCandidate, onDetect, onApproveS
     case "consolidating":
       return <div className="muted">distilling guidance from the pilot… (auto-advances)</div>
     case "awaiting_export":
-      return <button className="btn-primary" disabled title="export route not built yet">export dataset (todo)</button>
+      return (
+        <div>
+          <div className="muted" style={{ fontSize: 13, marginBottom: 8 }}>
+            target reached — package the accepted candidates into a COCO dataset.
+          </div>
+          <button className="btn-primary" disabled={busy} onClick={onExport}>
+            {busy ? "packaging…" : "package dataset (COCO)"}
+          </button>
+        </div>
+      )
     case "completed":
+      return <ExportResult runId={runId} busy={busy} onExport={onExport} summary={exportSummary} />
     case "aborted":
     case "failed":
       return <div className="muted">run {status}.</div>
@@ -293,6 +306,31 @@ function MaskReviewCard({ runId, busy, onApprove }) {
         onClick={() => onApprove([...kept])}>
         {busy ? "approving…" : `approve ${keptCount} region(s) → start pilot`}
       </button>
+    </div>
+  )
+}
+
+function ExportResult({ runId, busy, onExport, summary }) {
+  return (
+    <div style={{ border: "1px solid #e5e5e5", borderRadius: 8, padding: 16, marginTop: 4 }}>
+      <div style={{ fontWeight: 600, marginBottom: 8 }}>dataset packaged ✓</div>
+      {summary ? (
+        <div className="muted" style={{ fontSize: 13, marginBottom: 12, lineHeight: 1.7 }}>
+          {summary.images} images · {summary.annotations} annotations<br />
+          {summary.train_images} train / {summary.val_images} val · classes: {summary.categories.join(", ")}
+        </div>
+      ) : (
+        <div className="muted" style={{ fontSize: 13, marginBottom: 12 }}>
+          COCO dataset ready — re-package if you want fresh counts.
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        <a className="btn-primary" href={exportDownloadUrl(runId)}
+           style={{ textDecoration: "none", display: "inline-block" }}>download .zip</a>
+        <button className="link" disabled={busy} onClick={onExport}>
+          {busy ? "re-packaging…" : "re-package"}
+        </button>
+      </div>
     </div>
   )
 }

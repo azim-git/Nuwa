@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import Literal
 
+import export as export_mod
 import database
 import orchestrator
 from models import RunStatus
@@ -56,7 +57,7 @@ class Thresholds(BaseModel):
 class RunConfig(BaseModel):
     source_image_ids: list[str]
     dataset_description: str
-    defect_taxonomy: list[str] = ["scratch", "crack"]#Field(min_length=1)
+    defect_taxonomy: list[str] = Field(min_length=1) # ["scratch", "crack"]
     eval_prompt: str
     pilot_count: int = 2 #5
     target_count: int = 5 #30
@@ -266,6 +267,40 @@ async def decide(cid: str, body: DecisionRequest):
         kick_loop(run["id"])
     return {"candidate_status": cand["status"], "run_status": run["status"],
             "progress": run["progress"]}
+
+
+@app.post("/runs/{run_id}/export")
+async def export_run(run_id: str):
+    run = await database.get_run(app.state.db, run_id)
+    if run is None:
+        raise HTTPException(404, "run not found")
+    if run["status"] not in (RunStatus.AWAITING_EXPORT.value, RunStatus.COMPLETED.value):
+        raise HTTPException(409, f"run not ready to export (is {run['status']})")
+
+    entries = await database.list_dataset_entries(app.state.db, run_id)
+    if not entries:
+        raise HTTPException(400, "no accepted candidates to export")
+
+    src = await database.get_source_image(app.state.db, run["config"]["source_image_ids"][0])
+    if src is None:
+        raise HTTPException(400, "source image missing; cannot determine dimensions")
+
+    summary = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: export_mod.build_coco_export(
+            run, entries, width=src["width"], height=src["height"]))
+
+    run["status"] = RunStatus.COMPLETED.value
+    await orchestrator.sync_run(app.state.db, run)   # COMPLETED is terminal/sticky → persists + publishes
+    return {"run_status": run["status"], "export": summary}
+
+
+@app.get("/runs/{run_id}/export/download")
+async def download_export(run_id: str):
+    zip_path = export_mod.EXPORTS_DIR / f"{run_id}.zip"
+    if not zip_path.exists():
+        raise HTTPException(404, "no export found — run export first")
+    return FileResponse(zip_path, media_type="application/zip",
+                        filename=f"{run_id}_dataset.zip")
 
 
 @app.post("/runs/{run_id}/abort")

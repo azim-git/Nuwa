@@ -41,4 +41,4 @@ class ModelManager:
         fn = self._teardowns.get(consumer)
         if fn:
             await fn()                            # consumer owns its own teardown
-        logger.info("freeing GPU held by %s (stub)", consumer)
+        logger.info("freeing GPU held by %s ", consumer)
