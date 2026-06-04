@@ -13,7 +13,7 @@ TERMINAL_RUN = {RS.COMPLETED.value, RS.ABORTED.value, RS.FAILED.value}
 
 _REFERENCE_PROMPT = "clean circuit board, no defects"
 DIFF_GAIN = 1.0
-FAIL_DIFF_P95 = 0.15
+FAIL_DIFF_P95 = 0.2
 MAX_FAILURES_PER_DEFECT = 10
 
 def _bucket_for_defect(run: dict, defect_type: str) -> dict | None:
