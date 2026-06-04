@@ -1,7 +1,7 @@
 // src/RunDetail.jsx
 import { useEffect, useState } from "react"
 import { useRunStream } from "./useRunStream"
-import { getRun, getSource, detect, approveMask, abortRun, decideCandidate, exportRun, exportDownloadUrl, BASE_URL } from "./api"
+import { getRun, getSource, detect, approveMask, abortRun, decideCandidate, exportRun, exportDownloadUrl, regrid, BASE_URL } from "./api"
 
 export default function RunDetail({ runId, onBack }) {
   const { snapshot, connected } = useRunStream(runId)
@@ -58,7 +58,7 @@ export default function RunDetail({ runId, onBack }) {
         reviewCandidate={reviewCandidate}
         exportSummary={exportSummary}
         onDetect={() => cmd(() => detect(runId))}
-        onApproveSubset={(ids) => cmd(() => approveMask(runId, ids))}
+        onApproveSubset={(ids, disabled) => cmd(() => approveMask(runId, ids, disabled || []))}
         onAbort={() => cmd(() => abortRun(runId))}
         onExport={() => cmd(async () => setExportSummary((await exportRun(runId)).export))}
         onDecide={(decision, reason) =>
@@ -167,7 +167,7 @@ function PilotReviewCard({ candidate, busy, onDecide }) {
           src={`${BASE_URL}/runs/${candidate.run_id}/candidates/${candidate.id}/artifact/output`}
           alt="generated defect candidate"
           style={{
-            width: "100%", objectFit: "contain",
+            width: "100%", objectFit: "contain", maxHeight: "360px", 
             margin: "12px 0", borderRadius: 6, background: "#f4f4f4"
           }}
         />
@@ -223,88 +223,188 @@ function PilotReviewCard({ candidate, busy, onDecide }) {
 function MaskReviewCard({ runId, busy, onApprove }) {
   const [regions, setRegions] = useState(null)
   const [kept, setKept] = useState(() => new Set())
-  const [source, setSource] = useState(null)       // { id, width, height }
+  const [source, setSource] = useState(null)
+  const [hoveredId, setHoveredId] = useState(null)
+  const [maxPct, setMaxPct] = useState(100)
+  const [buckets, setBuckets] = useState([])
+  const [feasibility, setFeasibility] = useState({})
+  const [disabledDefects, setDisabledDefects] = useState(new Set())
+  const [bucketGrids, setBucketGrids] = useState({})      // {bucket_id: N}
+  const [bucketRegridding, setBucketRegridding] = useState({})
 
   useEffect(() => {
-    getRun(runId)
-      .then(async (r) => {
-        const regs = r.regions || []
-        setRegions(regs)
-        setKept(new Set(regs.map((x) => x.id)))
-        const srcId = r.config?.source_image_ids?.[0]
-        if (srcId) {
-          const meta = await getSource(srcId)
-          setSource({ id: srcId, width: meta.width, height: meta.height })
-        }
-      })
-      .catch(() => setRegions([]))
+    getRun(runId).then(async (r) => {
+      const regs = r.regions || []
+      setRegions(regs)
+      setKept(new Set(regs.map((x) => x.id)))
+      const bkts = r.domain_profile?.buckets || []
+      const feas = r.domain_profile?.feasibility || {}
+      setBuckets(bkts)
+      setFeasibility(feas)
+      setDisabledDefects(new Set(Object.entries(feas)
+        .filter(([, v]) => !v.feasible).map(([k]) => k)))
+      setBucketGrids(Object.fromEntries(bkts.map((b) => [b.id, b.grid?.rows || 3])))
+      const srcId = r.config?.source_image_ids?.[0]
+      if (srcId) {
+        const meta = await getSource(srcId)
+        setSource({ id: srcId, width: meta.width, height: meta.height })
+      }
+    }).catch(() => setRegions([]))
   }, [runId])
 
-  const sourceUrl = source?.id ? `${BASE_URL}/sources/${source.id}/file` : null
-
-  if (regions === null) return <div className="muted">loading detected regions…</div>
-  if (regions.length === 0) return <div className="muted">no regions detected.</div>
-
-  function toggle(id) {
-    setKept((prev) => {
-      const next = new Set(prev)
-      next.has(id) ? next.delete(id) : next.add(id)
-      return next
-    })
+  async function commitGrid(bucketId, n) {
+    setBucketRegridding((p) => ({ ...p, [bucketId]: true }))
+    try {
+      const res = await regrid(runId, bucketId, n, n)
+      const newRegs = res.regions
+      const oldIds = new Set((regions || []).filter((r) => r.bucket === bucketId).map((r) => r.id))
+      const newIds = new Set(newRegs.filter((r) => r.bucket === bucketId).map((r) => r.id))
+      setKept((p) => { const n = new Set([...p].filter((id) => !oldIds.has(id))); newIds.forEach((id) => n.add(id)); return n })
+      setRegions(newRegs)
+    } catch { /* keep current */ } finally {
+      setBucketRegridding((p) => ({ ...p, [bucketId]: false }))
+    }
   }
 
-  const vbW = source?.width || Math.max(...regions.map((r) => r.bbox[0] + r.bbox[2])) + 20
-  const vbH = source?.height || Math.max(...regions.map((r) => r.bbox[1] + r.bbox[3])) + 20
-  const keptCount = kept.size
+  function toggleDefect(d) {
+    setDisabledDefects((p) => { const n = new Set(p); n.has(d) ? n.delete(d) : n.add(d); return n })
+  }
+
+  const COLORS = ["#00b96b", "#0af", "#f70", "#b06cff", "#f06"]
+  const bColor = (bid) => COLORS[buckets.findIndex((b) => b.id === bid) % COLORS.length] || "#999"
+
+  const sourceUrl = source?.id ? `${BASE_URL}/sources/${source.id}/file` : null
+  if (regions === null) return <div className="muted">loading detected regions…</div>
+
+  const vbW = source?.width || (regions.length ? Math.max(...regions.map((r) => r.bbox[0] + r.bbox[2])) + 20 : 100)
+  const vbH = source?.height || (regions.length ? Math.max(...regions.map((r) => r.bbox[1] + r.bbox[3])) + 20 : 100)
+  const maxArea = (maxPct / 100) * vbW * vbH
+  const visible = regions.filter((r) => r.bbox[2] * r.bbox[3] <= maxArea)
+  const keptVisible = visible.filter((r) => kept.has(r.id)).map((r) => r.id)
+
+  function toggle(id) {
+    setKept((p) => { const n = new Set(p); n.has(id) ? n.delete(id) : n.add(id); return n })
+  }
 
   return (
     <div className="mask-review" style={{ border: "1.5px solid #111", padding: 16, marginTop: 12 }}>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap", marginBottom: 8 }}>
         <strong>review detected regions</strong>
-        <span className="muted">keeping {keptCount} of {regions.length}</span>
-        <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-          <button className="link" onClick={() => setKept(new Set(regions.map((r) => r.id)))}>all</button>
-          <button className="link" onClick={() => setKept(new Set())}>none</button>
-        </span>
+        <span className="muted">keeping {keptVisible.length} of {visible.length}</span>
       </div>
 
-      <svg viewBox={`0 0 ${vbW} ${vbH}`}
-        style={{ width: "100%", marginTop: 12, background: "#f4f4f4", borderRadius: 6 }}>
-        {sourceUrl && <image href={sourceUrl} x="0" y="0" width={vbW} height={vbH}
-          preserveAspectRatio="none" />}
-        {regions.map((r) => {
-          const on = kept.has(r.id)
-          const [x, y, w, h] = r.bbox
-          return (
-            <g key={r.id} onClick={() => toggle(r.id)} style={{ cursor: "pointer" }}>
-              {/* black outline for contrast on any background */}
-              <rect x={x} y={y} width={w} height={h}
-                fill="none" stroke="#000" strokeWidth={4} strokeOpacity={0.5} />
-              <rect x={x} y={y} width={w} height={h}
-                fill={on ? "rgba(0,255,120,0.18)" : "rgba(255,0,0,0.10)"}
-                stroke={on ? "#00ff78" : "#ff4444"}
-                strokeWidth={2}
-                strokeDasharray={on ? "0" : "6 4"} />
-              {/* label background for readability */}
-              <rect x={x} y={Math.max(0, y - 16)} width={r.id.length * 7 + 6} height={14}
-                rx={2} fill="rgba(0,0,0,0.65)" />
-              <text x={x + 3} y={Math.max(11, y - 5)} fontSize="11" fontWeight="bold"
-                fill={on ? "#00ff78" : "#ff6666"}>{r.id}</text>
-            </g>
-          )
-        })}
-      </svg>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
+        <label style={{ fontSize: 12, fontWeight: 600, whiteSpace: "nowrap" }}>max region size {maxPct}%</label>
+        <input type="range" min="1" max="100" value={maxPct} style={{ flex: 1 }}
+          onChange={(e) => setMaxPct(Number(e.target.value))} />
+      </div>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+        <svg viewBox={`0 0 ${vbW} ${vbH}`} style={{ flex: 2, minWidth: 0, maxHeight: 420, background: "#f4f4f4", borderRadius: 6 }}>
+          {sourceUrl && <image href={sourceUrl} x="0" y="0" width={vbW} height={vbH} preserveAspectRatio="none" />}
+          {visible.map((r) => {
+            const on = kept.has(r.id), hot = hoveredId === r.id
+            const col = bColor(r.bucket)
+            const [x, y, w, h] = r.bbox
+            return (
+              <g key={r.id} onClick={() => toggle(r.id)} style={{ cursor: "pointer" }}
+                onMouseEnter={() => setHoveredId(r.id)} onMouseLeave={() => setHoveredId(null)}>
+                <rect x={x} y={y} width={w} height={h} fill="none" stroke="#000"
+                  strokeWidth={hot ? 6 : 4} strokeOpacity={0.35} />
+                <rect x={x} y={y} width={w} height={h}
+                  fill={on ? `${col}30` : "rgba(255,0,0,0.08)"}
+                  stroke={hot ? "#fff" : on ? col : "#ff4444"}
+                  strokeWidth={hot ? 3 : 2} strokeDasharray={on ? "0" : "5 4"} />
+              </g>
+            )
+          })}
+        </svg>
+
+        <div style={{ flex: 1, minWidth: 190, maxHeight: 420, overflowY: "auto",
+                      border: "1px solid #ddd", borderRadius: 6, fontSize: 12 }}>
+          {buckets.map((b, bi) => {
+            const col = COLORS[bi % COLORS.length]
+            const bRegs = visible.filter((r) => r.bucket === b.id)
+            const bRegIds = new Set(bRegs.map((r) => r.id))
+            return (
+              <div key={b.id} style={{ borderBottom: "1px solid #e8e8e8" }}>
+                <div style={{ padding: "8px 8px 6px", background: `${col}15` }}>
+                  <div style={{ fontWeight: 700, color: col, marginBottom: 4 }}>{b.id}</div>
+                  {b.defects.map((d) => (
+                    <div key={d} style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
+                      <input type="checkbox" checked={!disabledDefects.has(d)}
+                        onChange={() => toggleDefect(d)} style={{ cursor: "pointer" }} />
+                      <span style={{ color: disabledDefects.has(d) ? "#aaa" : "#222" }}>{d}</span>
+                      {feasibility[d]?.feasible === false && (
+                        <span title={feasibility[d].reason}
+                          style={{ fontSize: 10, color: "#c80" }}>⚠ structural</span>
+                      )}
+                    </div>
+                  ))}
+                  {b.skipped && (
+                    <div style={{ fontSize: 10, color: "#999", marginTop: 4 }}>{b.skipped}</div>
+                  )}
+                  {b.region_mode === "subdivide" && !b.skipped && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+                      <span style={{ color: "#555", whiteSpace: "nowrap", fontSize: 11 }}>
+                        {bucketGrids[b.id] || 3}×{bucketGrids[b.id] || 3}
+                      </span>
+                      <input type="range" min="1" max="8" value={bucketGrids[b.id] || 3}
+                        disabled={bucketRegridding[b.id] || busy} style={{ flex: 1 }}
+                        onChange={(e) => setBucketGrids((p) => ({ ...p, [b.id]: Number(e.target.value) }))}
+                        onMouseUp={(e) => commitGrid(b.id, Number(e.target.value))}
+                        onTouchEnd={(e) => commitGrid(b.id, Number(e.target.value))} />
+                      {bucketRegridding[b.id] && <span className="muted" style={{ fontSize: 10 }}>…</span>}
+                    </div>
+                  )}
+                  {bRegs.length > 0 && (
+                    <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                      <button className="link" style={{ fontSize: 11 }}
+                        onClick={() => setKept((p) => new Set([...p, ...bRegIds]))}>all</button>
+                      <button className="link" style={{ fontSize: 11 }}
+                        onClick={() => setKept((p) => new Set([...p].filter((id) => !bRegIds.has(id))))}>none</button>
+                    </div>
+                  )}
+                </div>
+                {bRegs.map((r) => {
+                  const on = kept.has(r.id), hot = hoveredId === r.id
+                  const [x, y, w, h] = r.bbox
+                  return (
+                    <div key={r.id} onClick={() => toggle(r.id)}
+                      onMouseEnter={() => setHoveredId(r.id)} onMouseLeave={() => setHoveredId(null)}
+                      style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 8px",
+                        cursor: "pointer", borderTop: "1px solid #f0f0f0",
+                        background: hot ? "#eef6ff" : on ? `${col}12` : "transparent" }}>
+                      <svg viewBox={`${x} ${y} ${w} ${h}`} width={32} height={32}
+                        preserveAspectRatio="xMidYMid slice"
+                        style={{ borderRadius: 3, border: `2px solid ${on ? col : "#ddd"}`, flexShrink: 0 }}>
+                        {sourceUrl && <image href={sourceUrl} x="0" y="0" width={vbW} height={vbH} />}
+                      </svg>
+                      <div style={{ lineHeight: 1.3, overflow: "hidden" }}>
+                        <div style={{ fontWeight: 600, fontSize: 11 }}>{r.id}</div>
+                        <div className="muted" style={{ fontSize: 10 }}>{w}×{h}</div>
+                      </div>
+                      <span style={{ marginLeft: "auto", color: on ? col : "#bbb" }}>{on ? "✓" : "○"}</span>
+                    </div>
+                  )
+                })}
+                {bRegs.length === 0 && !b.skipped && (
+                  <div className="muted" style={{ padding: "6px 8px", fontSize: 10 }}>nothing in this size range</div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
 
       <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
-        deselected regions are pruned from the pool permanently — every candidate this run
-        samples only from what you keep here.
+        deselected regions are pruned permanently. unchecked defects are disabled for this run.
       </div>
-
       <button className="btn-primary" style={{ marginTop: 12 }}
-        disabled={busy || keptCount === 0}
-        title={keptCount === 0 ? "keep at least one region" : ""}
-        onClick={() => onApprove([...kept])}>
-        {busy ? "approving…" : `approve ${keptCount} region(s) → start pilot`}
+        disabled={busy || keptVisible.length === 0}
+        title={keptVisible.length === 0 ? "keep at least one region" : ""}
+        onClick={() => onApprove(keptVisible, [...disabledDefects])}>
+        {busy ? "approving…" : `approve ${keptVisible.length} region(s) → start pilot`}
       </button>
     </div>
   )

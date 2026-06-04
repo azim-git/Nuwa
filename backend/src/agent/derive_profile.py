@@ -1,20 +1,37 @@
-def derive_domain_profile(config: dict) -> dict:
-    """Derive the operational profile from the user's config.
+DEFAULT_DETECT_CONF = 0.1
+DEFAULT_DILATION_PX = 5
 
-    STUB — Track 4 replaces the body with a Qwen3-8B call.
-    The signature is the contract; callers never change.
+_EVAL_RUBRIC = [
+    "defect is visually realistic",
+    "defect is localised to the masked region",
+    "background is unchanged",
+    "defect matches the named class",
+]
+
+
+def derive_domain_profile(config: dict, image_description: str, semantic: dict) -> dict:
+    """Assemble the operational profile from the agent's bucketed reasoning + pipeline defaults.
+
+    `semantic` carries buckets (with detect_prompts, region_mode, grid per bucket),
+    feasibility, defect_strategies, and detect_rationale.
     """
-    taxonomy = config["defect_taxonomy"]
+    buckets = []
+    for b in semantic["buckets"]:
+        buckets.append({
+            "id":             b["id"],
+            "defects":        b["defects"],
+            "region_mode":    b["region_mode"],
+            "detect_prompts": b["detect_prompts"],
+            "detect_prompt":  None,                 # winner — chosen at detect (C2)
+            "detect_conf":    DEFAULT_DETECT_CONF,
+            "grid":           b["grid"],
+            "dilation_px":    DEFAULT_DILATION_PX,
+        })
     return {
-        "derived_by": "stub",
-        "mask_prompt": "silver circle",
-        "mask_conf": 0.1,
-        "dilation_px": 5,
-        "defect_strategies": {d: f"realistic {d}" for d in taxonomy},
-        "eval_rubric": [
-            "defect is visually realistic",
-            "defect is localised to the masked region",
-            "background is unchanged",
-            "defect matches the named class",
-        ],
+        "derived_by": "agent",
+        "image_description": image_description,
+        "buckets": buckets,
+        "feasibility": semantic["feasibility"],
+        "defect_strategies": semantic["defect_strategies"],
+        "eval_rubric": _EVAL_RUBRIC,
     }

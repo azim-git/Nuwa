@@ -66,3 +66,42 @@ class VisionClient:
         await asyncio.get_running_loop().run_in_executor(
             None, lambda: subprocess.run(["ollama", "stop", self.model], capture_output=True))
         logger.info("vision model stopped")
+
+    def _describe_sync(self, image_path: str) -> str:
+        import ollama, io, base64
+        from PIL import Image
+        img = Image.open(image_path).convert("RGB")
+        if max(img.size) > 1024:                          # keep the pass quick / in-ctx
+            s = 1024 / max(img.size)
+            img = img.resize((int(img.width * s), int(img.height * s)))
+        buf = io.BytesIO(); img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+
+        prompt = (
+            "You are inspecting a clean product image that will be used to synthesise "
+            "surface defects. Describe ONLY what is visible, factually and concisely "
+            "(2-3 sentences). Report:\n"
+            "- the main object and its material / surface\n"
+            "- the distinct repeated features on the surface — for EACH kind, give its visual "
+            "appearance (geometric shape and color, e.g. 'small silver circles', 'thin copper "
+            "lines') and roughly how many are visible. Describe how they LOOK, not their "
+            "engineering function\n"
+        )
+        return ollama.chat(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt, "images": [b64]}],
+            options={"temperature": 0.2, "num_ctx": 2048},
+            keep_alive=0, think=False,
+        )["message"]["content"].strip()
+
+    async def describe(self, image_path: str) -> str:
+        loop = asyncio.get_running_loop()
+        for attempt in range(3):
+            try:
+                return await loop.run_in_executor(None, self._describe_sync, image_path)
+            except Exception as e:
+                if attempt < 2 and "memory" in str(e).lower():
+                    logger.warning("vision describe OOM, settling then retrying (%d)", attempt + 1)
+                    await asyncio.sleep(3)
+                    continue
+                raise

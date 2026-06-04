@@ -18,8 +18,11 @@ export async function createRun(config) {
 export async function detect(runId) {
   return (await client.post(`/runs/${runId}/detect`)).data
 }
-export async function approveMask(runId, regionIds /* optional array */) {
-  return (await client.post(`/runs/${runId}/approve-mask`, { region_ids: regionIds ?? null })).data
+export async function approveMask(runId, regionIds, disabledDefects = []) {
+  return (await client.post(`/runs/${runId}/approve-mask`, {
+    region_ids: regionIds,
+    disabled_defects: disabledDefects,
+  })).data
 }
 export async function decideCandidate(cid, decision, reason) {
   return (await client.post(`/candidates/${cid}/decision`,
@@ -45,4 +48,9 @@ export async function exportRun(runId) {
 }
 export function exportDownloadUrl(runId) {
   return `${BASE_URL}/runs/${runId}/export/download`
+}
+export async function regrid(runId, bucketId, rows, cols) {
+  return (await client.post(`/runs/${runId}/regrid`, {
+    bucket_id: bucketId, rows, cols,
+  })).data   // { regions, grid }
 }

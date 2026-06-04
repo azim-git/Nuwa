@@ -12,61 +12,28 @@ TERMINAL     = {CS.ACCEPTED.value, CS.REJECTED.value, CS.FAILED.value}
 TERMINAL_RUN = {RS.COMPLETED.value, RS.ABORTED.value, RS.FAILED.value}
 
 _REFERENCE_PROMPT = "clean circuit board, no defects"
+DIFF_GAIN = 1.0
+FAIL_DIFF_P95 = 0.15
+MAX_FAILURES_PER_DEFECT = 10
 
-def new_candidate(run: dict) -> dict:
-    """Pick a defect type (least-generated) and a random subset of regions."""
-    regions = run.get("regions") or []
-    dpi = run["config"]["defects_per_image"]
-    k = random.randint(dpi["min"], min(dpi["max"], len(regions)))
-    chosen = random.sample(regions, k)
+def _bucket_for_defect(run: dict, defect_type: str) -> dict | None:
+    for b in (run["domain_profile"].get("buckets") or []):
+        if defect_type in b["defects"]:
+            return b
+    return None
+
+def _eligible_defects(run: dict, disabled: set) -> list[str]:
+    regions   = run.get("regions") or []
     per_class = run["progress"]["per_class"]
-    return {
-        "id": "cand_" + uuid4().hex[:8],
-        "run_id": run["id"],
-        "status": CS.PENDING.value,
-        "phase": run["progress"]["phase"],
-        "defect_type": min(per_class, key=per_class.get),
-        "parent_candidate_id": None,
-        "region_ids": [r["id"] for r in chosen],
-        "prompt": None, "artifacts": None, "evaluation": None,
-        "adaptation": None, "human_decision": None, "labels": None,
-        "created_at": util.utcnow_iso(),
-    }
-
-
-# ---- mocked stages (Track 3 swaps for real SAM3 / agent / ComfyUI / eval) ----
-
-def _mock_detect_regions(run: dict, n: int = 8) -> list[dict]:
-    out = []
-    for i in range(n):
-        x, y = random.randint(50, 950), random.randint(50, 380)
-        out.append({
-            "id": f"reg_{i:02d}",
-            "bbox": [x, y, 56, 56],
-            "mask_path": f"runs/{run['id']}/masks/reg_{i:02d}.png",
-            "via_count": 1,
-        })
-    return out
-
-
-def _mock_author(run: dict, cand: dict, *, feedback=None, guidance=None) -> str:
-    base = run["domain_profile"]["defect_strategies"].get(
-        cand["defect_type"], cand["defect_type"])
-    parts = [base]
-    if feedback:                                   # pilot: reactive per-candidate adaptation
-        parts.append(f"[avoid: {'; '.join(feedback)}]")
-    if guidance and guidance.get("positive_keywords"):   # full: frozen consolidation guidance
-        parts.append(f"[emphasize: {', '.join(guidance['positive_keywords'])}]")
-    return " ".join(parts)
-
-
-def _mock_compose(run: dict, cand: dict) -> dict:
-    base = f"runs/{run['id']}/{cand['id']}"
-    return {
-        "input_path":  f"runs/{run['id']}/source.png",
-        "mask_path":   f"{base}/composite_mask.png",
-        "output_path": None,
-    }
+    failed_pc = run["progress"].get("failed_per_class", {})
+    def _has_pool(d):
+        b = _bucket_for_defect(run, d)
+        if b is None: return False
+        return any(r["bucket"] == b["id"] for r in regions)
+    return [d for d in per_class
+            if d not in disabled
+            and _has_pool(d)
+            and failed_pc.get(d, 0) < MAX_FAILURES_PER_DEFECT]
 
 
 async def _accept(db, run: dict, cand: dict) -> None:
@@ -105,21 +72,42 @@ async def _recent_rejection_reasons(db, run: dict, limit: int = 3) -> list[str]:
     return reasons[-limit:]
 
 
-# ---- one stage per call, never crosses a gate ----
+def new_candidate(run: dict) -> dict | None:
+    disabled = set(run["progress"].get("disabled_defects") or [])
+    eligible  = _eligible_defects(run, disabled)
+    if not eligible:
+        return None
+    per_class = run["progress"]["per_class"]
+    defect    = min(eligible, key=lambda d: per_class[d])
+    bucket    = _bucket_for_defect(run, defect)
+    pool      = [r for r in (run.get("regions") or []) if r["bucket"] == bucket["id"]]
+    dpi       = run["config"]["defects_per_image"]
+    k         = random.randint(dpi["min"], min(dpi["max"], len(pool)))
+    chosen    = random.sample(pool, k)
+    return {
+        "id": "cand_" + uuid4().hex[:8], "run_id": run["id"],
+        "status": CS.PENDING.value, "phase": run["progress"]["phase"],
+        "defect_type": defect, "parent_candidate_id": None,
+        "region_ids": [r["id"] for r in chosen], "prompt": None,
+        "artifacts": None, "evaluation": None, "adaptation": None,
+        "human_decision": None, "labels": None, "created_at": util.utcnow_iso(),
+    }
+
 
 async def step_candidate(db, run: dict, cand: dict, *, mm, comfy, vision, agent) -> dict:
     s = cand["status"]
 
     if s == CS.PENDING.value:                    # author prompt (agent) + composite mask
         dd = run["config"]["dataset_description"]
+        strategy = run["domain_profile"]["defect_strategies"].get(cand["defect_type"])
         async with mm.use("agent"):              # frees comfy/vision from the prior candidate
             if cand["phase"] == "pilot":
                 feedback = await _recent_rejection_reasons(db, run)
-                cand["prompt"] = await agent.author(dd, cand["defect_type"], feedback=feedback)
+                cand["prompt"] = await agent.author(dd, cand["defect_type"], strategy=strategy, feedback=feedback)
                 cand["adaptation"] = {"based_on": feedback} if feedback else None
             else:
                 guidance = run["domain_profile"].get("prompt_guidance")
-                cand["prompt"] = await agent.author(dd, cand["defect_type"], guidance=guidance)
+                cand["prompt"] = await agent.author(dd, cand["defect_type"], strategy=strategy, guidance=guidance)
                 cand["adaptation"] = None
         source_path = await database.resolve_source_image(db, run)
         cand["artifacts"] = await asyncio.get_running_loop().run_in_executor(
@@ -145,6 +133,16 @@ async def step_candidate(db, run: dict, cand: dict, *, mm, comfy, vision, agent)
 
     elif s == CS.EVALUATING.value:               # evaluate, then route BY PHASE
         cand["evaluation"] = await _evaluate(db, run, cand, mm, vision)
+
+        p95 = cand["evaluation"].get("diff_p95")
+        if p95 is not None and p95 < FAIL_DIFF_P95:        # nothing meaningful rendered
+            cand["status"] = CS.FAILED.value
+            cand["evaluation"]["reason"] = f"generation failed: peak change {p95} < floor {FAIL_DIFF_P95}"
+            fc = run["progress"].setdefault("failed_per_class", {d: 0 for d in run["config"]["defect_taxonomy"]})
+            fc[cand["defect_type"]] = fc.get(cand["defect_type"], 0) + 1
+            await database.update_candidate(db, cand)
+            return cand
+
         if cand["phase"] == "pilot":
             cand["status"] = CS.AWAITING_REVIEW.value      # human decides; scores advisory
             await database.update_candidate(db, cand)
@@ -272,8 +270,13 @@ async def advance(db, run: dict, *, mm, comfy, vision, agent) -> bool:
         return False                           # draft / awaiting_* / export / terminal
 
     cand = await _active_candidate(db, run)
-    if cand is None:                           # no one in flight → start the next candidate
+    if cand is None:
         cand = new_candidate(run)
+        if cand is None:                              # no eligible defects left
+            run["error"] = "no eligible defects — all pools empty or disabled"
+            run["status"] = RS.FAILED.value
+            await database.update_run(db, run)
+            return False
         await database.insert_candidate(db, cand)
         await sync_run(db, run)
         return True
@@ -287,29 +290,95 @@ from pathlib import Path
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RUNS_DIR = DATA_DIR / "runs"
 
-def masks_to_regions(run: dict, masks: list) -> list[dict]:
-    """SAM3 binary masks → region pool, writing one PNG per via (white via on black)."""
+def _bbox_iou(a, b) -> float:
+    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+    ix1, iy1 = min(a[0] + a[2], b[0] + b[2]), min(a[1] + a[3], b[1] + b[3])
+    inter = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+    return inter / (a[2] * a[3] + b[2] * b[3] - inter) if inter else 0.0
+
+
+def masks_to_regions(run: dict, masks: list, bucket: dict) -> list[dict]:
+    """One bucket's masks → regions tagged with the bucket id.
+    instance: one region per mask (near-dups dropped); subdivide: grid each mask.
+    Caller clears the masks dir once before the bucket loop; ids are bucket-prefixed."""
     import numpy as np
     from PIL import Image
+    mode = bucket["region_mode"]
+    grid = bucket.get("grid")
+    bid = bucket["id"]
     masks_dir = DATA_DIR / "runs" / run["id"] / "masks"
     masks_dir.mkdir(parents=True, exist_ok=True)
-    regions, idx = [], 0
-    for m in masks:
-        ys, xs = np.where(m > 0)
+    regions = []
+
+    def _emit(submask):
+        ys, xs = np.where(submask > 0)
         if xs.size == 0:
-            continue                                   # skip empty mask
+            return
         x0, y0 = int(xs.min()), int(ys.min())
-        rid = f"reg_{idx:03d}"
-        mask_path = masks_dir / f"{rid}.png"
-        Image.fromarray(m).save(mask_path)             # PoC convention: white=via
+        rid = f"{bid}_{len(regions):03d}"
+        Image.fromarray(submask).save(masks_dir / f"{rid}.png")
         regions.append({
             "id": rid,
             "bbox": [x0, y0, int(xs.max() - x0 + 1), int(ys.max() - y0 + 1)],
-            "mask_path": str(mask_path),
-            "via_count": 1,
+            "mask_path": str(masks_dir / f"{rid}.png"),
+            "bucket": bid, "via_count": 1,
         })
-        idx += 1
+
+    if mode == "subdivide" and grid:
+        rows, cols = int(grid["rows"]), int(grid["cols"])
+        for m in masks:
+            ys, xs = np.where(m > 0)
+            if xs.size == 0:
+                continue
+            x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+            ch = max(1, (y1 - y0 + 1) // rows)
+            cw = max(1, (x1 - x0 + 1) // cols)
+            for r in range(rows):
+                for c in range(cols):
+                    cy0, cx0 = y0 + r * ch, x0 + c * cw
+                    cy1 = (y1 + 1) if r == rows - 1 else cy0 + ch
+                    cx1 = (x1 + 1) if c == cols - 1 else cx0 + cw
+                    cell = np.zeros_like(m)
+                    cell[cy0:cy1, cx0:cx1] = m[cy0:cy1, cx0:cx1]
+                    _emit(cell)
+    else:
+        cands = []
+        for m in masks:
+            ys, xs = np.where(m > 0)
+            if xs.size == 0:
+                continue
+            bbox = [int(xs.min()), int(ys.min()),
+                    int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)]
+            cands.append((m, bbox))
+        kept_m = []
+        for m, bbox in cands:
+            if any(_bbox_iou(bbox, kb) > 0.85 for _, kb in kept_m):
+                continue
+            kept_m.append((m, bbox))
+        for m, _ in kept_m:
+            _emit(m)
+
     return regions
+
+
+def save_object_masks(obj_dir, masks) -> list[str]:
+    """Persist the raw winning masks so subdivide can be re-gridded without re-running SAM3."""
+    import shutil
+    from PIL import Image
+    if obj_dir.exists(): shutil.rmtree(obj_dir)
+    obj_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for i, m in enumerate(masks):
+        pth = obj_dir / f"obj_{i:02d}.png"
+        Image.fromarray(m).save(pth)
+        paths.append(str(pth))
+    return paths
+
+
+def load_object_masks(paths: list[str]) -> list:
+    import numpy as np
+    from PIL import Image
+    return [np.array(Image.open(p).convert("L")) for p in paths]
 
 
 def compose_inputs(run: dict, cand: dict, source_path: str) -> dict:
@@ -332,7 +401,8 @@ def compose_inputs(run: dict, cand: dict, source_path: str) -> dict:
             m = np.array(Image.fromarray(m).resize((W, H), Image.NEAREST))
         union = np.maximum(union, m)
 
-    px = run["domain_profile"]["dilation_px"]           # compose-time, from the profile
+    bucket = _bucket_for_defect(run, cand["defect_type"])
+    px     = bucket["dilation_px"] if bucket else 5  # default 5px if bucket not found
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (px * 2 + 1, px * 2 + 1))
     dilated = cv2.dilate(union, kernel, iterations=1)
     alpha = cv2.bitwise_not(dilated)                    # ComfyUI: white=keep, black=inpaint
@@ -349,24 +419,23 @@ def compose_inputs(run: dict, cand: dict, source_path: str) -> dict:
             "output_path": None, "source_path": str(source_out)}
 
 
-DIFF_GAIN = 1.0   # placeholder — calibrate from real diffs (see below)
-
-def _diff_score(output_path: str, reference_path: str, mask_path: str) -> float:
-    """Mean inpaint-vs-inpaint difference inside the defect region, normalised."""
+def _diff_score(output_path: str, reference_path: str, mask_path: str) -> dict:
+    """Inpaint-vs-inpaint diff inside the defect region.
+    mean → quality score (gained+clamped); p95 → size-invariant 'did anything render'."""
     from PIL import Image, ImageChops
     import numpy as np
     out = Image.open(output_path).convert("RGB")
     ref = Image.open(reference_path).convert("RGB")
     w, h = min(out.width, ref.width), min(out.height, ref.height)
-    out, ref = out.crop((0, 0, w, h)), ref.crop((0, 0, w, h))     # per your PoC
-
+    out, ref = out.crop((0, 0, w, h)), ref.crop((0, 0, w, h))
     diff = np.asarray(ImageChops.difference(out, ref), dtype=np.float32).mean(axis=2)
     mask = np.asarray(Image.open(mask_path).convert("L").resize((w, h), Image.NEAREST))
-    region = mask < 128                                           # black = inpaint area
+    region = mask < 128
     if region.sum() == 0:
-        return 0.0
-    raw = float(diff[region].mean()) / 255.0
-    return round(min(1.0, raw * DIFF_GAIN), 4)
+        return {"mean": 0.0, "p95": 0.0}
+    vals = diff[region] / 255.0
+    return {"mean": round(min(1.0, float(vals.mean()) * DIFF_GAIN), 4),
+            "p95":  round(float(np.percentile(vals, 95)), 4)}
 
 
 def _union_bbox(boxes):
@@ -377,11 +446,13 @@ def _union_bbox(boxes):
 
 async def _evaluate(db, run, cand, mm, vision) -> dict:
     ref = _reference_path(run)
-    diff = None
+    stats = None
     if ref.exists():
-        diff = await asyncio.get_running_loop().run_in_executor(
+        stats = await asyncio.get_running_loop().run_in_executor(
             None, _diff_score, cand["artifacts"]["output_path"],
             str(ref), cand["artifacts"]["mask_path"])
+    diff     = stats["mean"] if stats else None
+    diff_p95 = stats["p95"] if stats else None
 
     rmap = {r["id"]: r for r in (run.get("regions") or [])}
     boxes = [rmap[rid]["bbox"] for rid in cand["region_ids"] if rid in rmap]
@@ -392,7 +463,8 @@ async def _evaluate(db, run, cand, mm, vision) -> dict:
 
     w = run["config"]["score_weights"]
     combined = round((diff or 0.0) * w["diff"] + v["vision_score"] * w["vision"], 2)
-    return {"diff_score": diff, "vision_score": v["vision_score"], "combined_score": combined,
+    return {"diff_score": diff, "diff_p95": diff_p95,
+            "vision_score": v["vision_score"], "combined_score": combined,
             "vision_verdict": v["vision_verdict"], "reason": v["reason"]}
 
 

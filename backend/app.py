@@ -35,7 +35,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)-20s %(leveln
 
 class DefectsPerImage(BaseModel):
     min: int = 1
-    max: int = 3
+    max: int = 10
 
 
 class Gates(BaseModel):
@@ -59,6 +59,7 @@ class RunConfig(BaseModel):
     dataset_description: str
     defect_taxonomy: list[str] = Field(min_length=1) # ["scratch", "crack"]
     eval_prompt: str
+    placement: str = ""
     pilot_count: int = 2 #5
     target_count: int = 5 #30
     gates: Gates = Field(default_factory=Gates)
@@ -69,7 +70,8 @@ class RunConfig(BaseModel):
 
 
 class ApproveMaskRequest(BaseModel):
-    region_ids: list[str] | None = None     # None = keep all detected regions
+    region_ids:       list[str] | None = None   # None = keep all
+    disabled_defects: list[str] | None = None   # defects toggled off at mask review
 
 
 class DecisionRequest(BaseModel):
@@ -146,13 +148,12 @@ async def list_runs():
 @app.post("/runs", status_code=201)
 async def create_run(config: RunConfig):
     config_dict = config.model_dump()
-    profile = derive_domain_profile(config_dict)
     now = utcnow_iso()
     run = {
         "id": "run_" + uuid4().hex[:8],
         "status": RunStatus.DRAFT.value,
         "config": config_dict,
-        "domain_profile": profile,
+        "domain_profile": None,
         "progress": {
             "phase": "pilot",
             "target": config.target_count,
@@ -167,6 +168,8 @@ async def create_run(config: RunConfig):
         "error": None,
         "created_at": now,
         "updated_at": now,
+        "per_class":        {d: 0 for d in config.defect_taxonomy},
+        "failed_per_class": {d: 0 for d in config.defect_taxonomy},
     }
     await database.insert_run(app.state.db, run)
     return run
@@ -215,18 +218,70 @@ async def detect(run_id: str):
     if run is None: raise HTTPException(404, "run not found")
     if run["status"] != RunStatus.DRAFT.value:
         raise HTTPException(409, f"can only detect from draft (is {run['status']})")
-    p = run["domain_profile"]
     try:
         image_path = await database.resolve_source_image(app.state.db, run)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+    if run["domain_profile"] is None:
+        cfg = run["config"]
+        async with app.state.mm.use("vision"):
+            image_description = await app.state.vision.describe(image_path)
+        async with app.state.mm.use("agent"):
+            semantic = await app.state.agent.derive_profile(
+                image_description, cfg["dataset_description"],
+                cfg.get("placement", ""), cfg["defect_taxonomy"])
+        run["domain_profile"] = derive_domain_profile(cfg, image_description, semantic)
+        await database.update_run(app.state.db, run)
+
+    import shutil
+    loop = asyncio.get_running_loop()
+    masks_dir = orchestrator.RUNS_DIR / run["id"] / "masks"
+    if masks_dir.exists():
+        shutil.rmtree(masks_dir)                          # clear once for all buckets
+
+    feasibility = run["domain_profile"].get("feasibility", {})
+    def _feasible(d):
+        return feasibility.get(d, {}).get("feasible", True)
+
+    all_regions = []
     async with app.state.mm.use("sam3"):
-        masks = await app.state.sam3.detect(image_path, p["mask_prompt"], p["mask_conf"])
-        run["regions"] = await asyncio.get_running_loop().run_in_executor(
-            None, orchestrator.masks_to_regions, run, masks)
-    await app.state.mm.free_all()                       # next GPU use is gated behind human mask review
+        for bucket in run["domain_profile"]["buckets"]:
+            mode = bucket["region_mode"]
+            if all(not _feasible(d) for d in bucket["defects"]):       # skip all-infeasible buckets
+                bucket["detect_prompt"] = None
+                bucket["detect_attempts"] = []
+                bucket["skipped"] = "all defects structural / infeasible"
+                continue
+
+            def _score(ms, mode=mode):
+                if mode == "subdivide":
+                    return max((int((m > 0).sum()) for m in ms), default=0)   # largest SINGLE mask
+                return len(ms)
+
+            best_prompt, best_masks, attempts = None, [], []
+            for cand in bucket["detect_prompts"]:
+                m = await app.state.sam3.detect(image_path, cand, bucket["detect_conf"])
+                attempts.append({"prompt": cand, "count": len(m), "score": _score(m)})
+                if _score(m) > _score(best_masks):
+                    best_prompt, best_masks = cand, m
+            bucket["detect_prompt"]   = best_prompt or bucket["detect_prompts"][0]
+            bucket["detect_attempts"] = attempts
+
+            if mode == "subdivide" and best_masks:
+                best_masks = [max(best_masks, key=lambda m: int((m > 0).sum()))]   # grid the object only
+                obj_dir = orchestrator.RUNS_DIR / run["id"] / "object" / bucket["id"]
+                bucket["object_mask_paths"] = await loop.run_in_executor(
+                    None, orchestrator.save_object_masks, obj_dir, best_masks)
+
+            regs = await loop.run_in_executor(
+                None, orchestrator.masks_to_regions, run, best_masks, bucket)
+            all_regions.extend(regs)
+
+    run["regions"] = all_regions
+    await app.state.mm.free_all()
     run = await orchestrator.sync_run(app.state.db, run)
-    return {"run_status": run["status"], "regions": run["regions"]}
+    return {"run_status": run["status"], "regions": run["regions"], "profile": run["domain_profile"]}
 
 
 @app.post("/runs/{run_id}/approve-mask")
@@ -235,17 +290,24 @@ async def approve_mask(run_id: str, body: ApproveMaskRequest):
     if run is None:
         raise HTTPException(404, "run not found")
     if run["status"] != RunStatus.AWAITING_MASK_REVIEW.value:
-        raise HTTPException(409, f"not awaiting mask review (is {run['status']})")
-    if body.region_ids is not None:                           # prune to the kept subset
-        keep = set(body.region_ids)
-        run["regions"] = [r for r in run["regions"] if r["id"] in keep]
-        if not run["regions"]:
-            raise HTTPException(400, "must keep at least one region")
+        raise HTTPException(409, f"can only approve at mask review (is {run['status']})")
+
+    if body.region_ids is not None:
+        rset = set(body.region_ids)
+        run["regions"] = [r for r in (run["regions"] or []) if r["id"] in rset]
+
+    disabled = set(body.disabled_defects or [])
+    run["progress"]["disabled_defects"] = list(disabled)
+
+    eligible = orchestrator._eligible_defects(run, disabled)
+    if not eligible:
+        raise HTTPException(400, "no eligible defects after pruning — enable at least one defect "
+                            "with a non-empty region pool before approving")
+
     run["progress"]["mask_approved"] = True
     run = await orchestrator.sync_run(app.state.db, run)
-    if run["status"] in orchestrator.LIVE_RUN:
-        kick_loop(run_id)
-    return {"run_status": run["status"], "region_count": len(run["regions"])}
+    kick_loop(run["id"])
+    return {"run_status": run["status"]}
 
 
 @app.post("/candidates/{cid}/decision")
@@ -325,6 +387,45 @@ async def abort_run(run_id: str):
 @app.get("/runs/{run_id}/candidates")
 async def get_candidates(run_id: str):
     return await database.list_candidates(app.state.db, run_id)
+
+
+class RegridRequest(BaseModel):
+    bucket_id: str
+    rows: int = 3
+    cols: int = 3
+
+
+@app.post("/runs/{run_id}/regrid")
+async def regrid(run_id: str, req: RegridRequest):
+    run = await database.get_run(app.state.db, run_id)
+    if run is None: raise HTTPException(404, "run not found")
+    if run["status"] != RunStatus.AWAITING_MASK_REVIEW.value:
+        raise HTTPException(409, f"can only regrid at mask review (is {run['status']})")
+
+    bucket = next((b for b in run["domain_profile"]["buckets"] if b["id"] == req.bucket_id), None)
+    if bucket is None:
+        raise HTTPException(404, f"bucket {req.bucket_id!r} not found")
+    if bucket["region_mode"] != "subdivide" or not bucket.get("object_mask_paths"):
+        raise HTTPException(400, "regrid only applies to subdivide buckets")
+
+    bucket["grid"] = {"rows": max(1, min(req.rows, 8)), "cols": max(1, min(req.cols, 8))}
+
+    # clean stale PNGs for this bucket only
+    masks_dir = orchestrator.RUNS_DIR / run["id"] / "masks"
+    for f in masks_dir.glob(f"{req.bucket_id}_*.png"):
+        f.unlink(missing_ok=True)
+
+    loop = asyncio.get_running_loop()
+    masks = await loop.run_in_executor(
+        None, orchestrator.load_object_masks, bucket["object_mask_paths"])
+    new_regs = await loop.run_in_executor(
+        None, orchestrator.masks_to_regions, run, masks, bucket)
+
+    # replace only this bucket's regions in the flat list
+    run["regions"] = [r for r in (run["regions"] or []) if r["bucket"] != req.bucket_id] + new_regs
+
+    run = await orchestrator.sync_run(app.state.db, run)
+    return {"regions": run["regions"], "grid": bucket["grid"]}
 
 
 _ARTIFACT_KEYS = {
