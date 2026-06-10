@@ -120,6 +120,8 @@ async def step_candidate(db, run: dict, cand: dict, *, mm, comfy, vision, agent)
     elif s == CS.GENERATING.value:                       # clean reference (once) + defect pass
         run_dir = RUNS_DIR / run["id"]
         ref = _reference_path(run)
+        ip = run["config"].get("inpainting") or {}
+        comfy_kw = {k: ip[k] for k in ("cfg", "steps", "denoise", "controlnet_strength") if k in ip}
         async with mm.use("comfyui"):
             if not ref.exists():                         # the +1, once per run
                 src = await database.resolve_source_image(db, run)
@@ -127,7 +129,7 @@ async def step_candidate(db, run: dict, cand: dict, *, mm, comfy, vision, agent)
                     None, _build_keep_all_rgba, src, str(run_dir / "reference_input.png"))
                 await comfy.inpaint(rgba, _REFERENCE_PROMPT, str(ref))
             out_path = str(run_dir / cand["id"] / "output.png")
-            await comfy.inpaint(cand["artifacts"]["input_path"], cand["prompt"], out_path)
+            await comfy.inpaint(cand["artifacts"]["input_path"], cand["prompt"], out_path, **comfy_kw)
         cand["artifacts"]["output_path"] = out_path
         cand["status"] = CS.EVALUATING.value
 
@@ -147,6 +149,19 @@ async def step_candidate(db, run: dict, cand: dict, *, mm, comfy, vision, agent)
             cand["status"] = CS.AWAITING_REVIEW.value      # human decides; scores advisory
             await database.update_candidate(db, cand)
             return cand
+
+        # Vision hard gate — full phase only (pilot goes to human review anyway)
+        vs = cand["evaluation"].get("vision_score")
+        if vs is not None and vs < 0.67:                    # vision_verdict == "fail"
+            cand["status"] = CS.FAILED.value
+            cand["evaluation"]["reason"] = (
+                f"vision gate: score {vs} < 0.67 — {cand['evaluation'].get('reason', '')}")
+            fc = run["progress"].setdefault("failed_per_class",
+                {d: 0 for d in run["config"]["defect_taxonomy"]})
+            fc[cand["defect_type"]] = fc.get(cand["defect_type"], 0) + 1
+            await database.update_candidate(db, cand)
+            return cand
+
         guidance  = run["domain_profile"].get("prompt_guidance") or {}
         threshold = guidance.get("validated_threshold", run["config"]["thresholds"]["auto_accept_above"])
         combined  = cand["evaluation"]["combined_score"]
@@ -419,9 +434,9 @@ def compose_inputs(run: dict, cand: dict, source_path: str) -> dict:
             "output_path": None, "source_path": str(source_out)}
 
 
-def _diff_score(output_path: str, reference_path: str, mask_path: str) -> dict:
-    """Inpaint-vs-inpaint diff inside the defect region.
-    mean → quality score (gained+clamped); p95 → size-invariant 'did anything render'."""
+def _region_diff(output_path: str, reference_path: str, mask_path: str):
+    """Raw per-pixel diff values inside the masked region, normalised to [0,1].
+    Returns the 1-D array (may be empty if region is zero-sized)."""
     from PIL import Image, ImageChops
     import numpy as np
     out = Image.open(output_path).convert("RGB")
@@ -432,8 +447,17 @@ def _diff_score(output_path: str, reference_path: str, mask_path: str) -> dict:
     mask = np.asarray(Image.open(mask_path).convert("L").resize((w, h), Image.NEAREST))
     region = mask < 128
     if region.sum() == 0:
+        return np.array([], dtype=np.float32)
+    return diff[region] / 255.0
+
+
+def _diff_score(output_path: str, reference_path: str, mask_path: str) -> dict:
+    """Inpaint-vs-inpaint diff inside the defect region.
+    mean → quality score (gained+clamped); p95 → size-invariant 'did anything render'."""
+    import numpy as np
+    vals = _region_diff(output_path, reference_path, mask_path)
+    if vals.size == 0:
         return {"mean": 0.0, "p95": 0.0}
-    vals = diff[region] / 255.0
     return {"mean": round(min(1.0, float(vals.mean()) * DIFF_GAIN), 4),
             "p95":  round(float(np.percentile(vals, 95)), 4)}
 

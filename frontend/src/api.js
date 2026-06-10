@@ -54,3 +54,8 @@ export async function regrid(runId, bucketId, rows, cols) {
     bucket_id: bucketId, rows, cols,
   })).data   // { regions, grid }
 }
+export async function remode(runId, bucketId, regionMode, grid) {
+  return (await client.post(`/runs/${runId}/remode`, {
+    bucket_id: bucketId, region_mode: regionMode, grid,
+  })).data   // { regions, grid, region_mode }
+}

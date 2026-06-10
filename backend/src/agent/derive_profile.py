@@ -33,5 +33,6 @@ def derive_domain_profile(config: dict, image_description: str, semantic: dict) 
         "buckets": buckets,
         "feasibility": semantic["feasibility"],
         "defect_strategies": semantic["defect_strategies"],
+        "detect_rationale": semantic.get("detect_rationale", ""),
         "eval_rubric": _EVAL_RUBRIC,
     }

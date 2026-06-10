@@ -22,19 +22,27 @@ class ComfyUIClient:
         except Exception:
             return False
 
-    def _build_workflow(self, input_filename: str, prompt: str) -> dict:
+    def _build_workflow(self, input_filename: str, prompt: str, *,
+                        cfg: float = 4, steps: int = 8,
+                        denoise: float = 1.0, controlnet_strength: float = 0.15) -> dict:
         wf = json.loads(_WF.read_text())
-        wf["137"]["inputs"]["image"]   = f"{input_filename} [input]"   # LoadImage
-        wf["652:45"]["inputs"]["text"] = prompt                        # positive prompt
-        wf["652:44"]["inputs"]["seed"] = int(time.time() * 1000) % (2**32)
+        wf["137"]["inputs"]["image"]       = f"{input_filename} [input]"
+        wf["652:45"]["inputs"]["text"]     = prompt
+        wf["652:44"]["inputs"]["seed"]     = int(time.time() * 1000) % (2**32)
+        wf["652:44"]["inputs"]["cfg"]      = cfg
+        wf["652:44"]["inputs"]["steps"]    = steps
+        wf["652:44"]["inputs"]["denoise"]  = denoise
+        wf["652:73"]["inputs"]["strength"] = controlnet_strength
         return wf
 
     async def inpaint(self, rgba_path: str, prompt: str, save_to: str,
-                      timeout: int = 300) -> str:
+                      timeout: int = 300, *, cfg: float = 4, steps: int = 8,
+                      denoise: float = 1.0, controlnet_strength: float = 0.15) -> str:
         # stage the RGBA input where ComfyUI's LoadImage can see it
         fname = Path(rgba_path).name
         shutil.copy(rgba_path, self.input_dir / fname)
-        wf = self._build_workflow(fname, prompt)
+        wf = self._build_workflow(fname, prompt, cfg=cfg, steps=steps,
+                                  denoise=denoise, controlnet_strength=controlnet_strength)
 
         async with aiohttp.ClientSession() as s:
             async with s.post(f"{self.base_url}/prompt", json={"prompt": wf}) as r:

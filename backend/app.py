@@ -54,6 +54,13 @@ class Thresholds(BaseModel):
     auto_reject_below: float = 0.45
 
 
+class InpaintingParams(BaseModel):
+    cfg: float = 4
+    steps: int = 8
+    denoise: float = 1.0
+    controlnet_strength: float = 0.15
+
+
 class RunConfig(BaseModel):
     source_image_ids: list[str]
     dataset_description: str
@@ -67,6 +74,7 @@ class RunConfig(BaseModel):
     thresholds: Thresholds = Field(default_factory=Thresholds)
     on_reject: str = "retry_same_region"
     defects_per_image: DefectsPerImage = Field(default_factory=DefectsPerImage)
+    inpainting: InpaintingParams = Field(default_factory=InpaintingParams)
 
 
 class ApproveMaskRequest(BaseModel):
@@ -248,11 +256,12 @@ async def detect(run_id: str):
     async with app.state.mm.use("sam3"):
         for bucket in run["domain_profile"]["buckets"]:
             mode = bucket["region_mode"]
-            if all(not _feasible(d) for d in bucket["defects"]):       # skip all-infeasible buckets
-                bucket["detect_prompt"] = None
-                bucket["detect_attempts"] = []
-                bucket["skipped"] = "all defects structural / infeasible"
-                continue
+            # Tag but don't skip — detection runs for all buckets; feasibility only gates generation
+            bucket.pop("skipped", None)
+            if all(not _feasible(d) for d in bucket["defects"]):
+                bucket["infeasible_warning"] = "all defects marked structural — generation will skip unless you enable them"
+            else:
+                bucket.pop("infeasible_warning", None)
 
             def _score(ms, mode=mode):
                 if mode == "subdivide":
@@ -268,11 +277,14 @@ async def detect(run_id: str):
             bucket["detect_prompt"]   = best_prompt or bucket["detect_prompts"][0]
             bucket["detect_attempts"] = attempts
 
+            # Always save raw object masks (needed for remode/regrid)
+            obj_dir = orchestrator.RUNS_DIR / run["id"] / "object" / bucket["id"]
+            await loop.run_in_executor(
+                None, orchestrator.save_object_masks, obj_dir, best_masks)
+            bucket["object_mask_paths"] = [str(p) for p in sorted(obj_dir.glob("*.png"))]
+
             if mode == "subdivide" and best_masks:
                 best_masks = [max(best_masks, key=lambda m: int((m > 0).sum()))]   # grid the object only
-                obj_dir = orchestrator.RUNS_DIR / run["id"] / "object" / bucket["id"]
-                bucket["object_mask_paths"] = await loop.run_in_executor(
-                    None, orchestrator.save_object_masks, obj_dir, best_masks)
 
             regs = await loop.run_in_executor(
                 None, orchestrator.masks_to_regions, run, best_masks, bucket)
@@ -387,6 +399,49 @@ async def abort_run(run_id: str):
 @app.get("/runs/{run_id}/candidates")
 async def get_candidates(run_id: str):
     return await database.list_candidates(app.state.db, run_id)
+
+
+class RemodeRequest(BaseModel):
+    bucket_id: str
+    region_mode: Literal["instance", "subdivide"]
+    grid: dict | None = None  # {"rows": N, "cols": N} — only for subdivide
+
+
+@app.post("/runs/{run_id}/remode")
+async def remode(run_id: str, req: RemodeRequest):
+    run = await database.get_run(app.state.db, run_id)
+    if run is None: raise HTTPException(404, "run not found")
+    if run["status"] != RunStatus.AWAITING_MASK_REVIEW.value:
+        raise HTTPException(409, f"can only remode at mask review (is {run['status']})")
+
+    bucket = next((b for b in run["domain_profile"]["buckets"] if b["id"] == req.bucket_id), None)
+    if bucket is None:
+        raise HTTPException(404, f"bucket {req.bucket_id!r} not found")
+    if not bucket.get("object_mask_paths"):
+        raise HTTPException(400, "no stored masks — re-run detect first")
+
+    bucket["region_mode"] = req.region_mode
+    if req.region_mode == "subdivide":
+        g = req.grid or {"rows": 3, "cols": 3}
+        bucket["grid"] = {"rows": max(1, min(g.get("rows", 3), 8)),
+                          "cols": max(1, min(g.get("cols", 3), 8))}
+    else:
+        bucket.pop("grid", None)
+
+    # clean stale region PNGs for this bucket
+    masks_dir = orchestrator.RUNS_DIR / run["id"] / "masks"
+    for f in masks_dir.glob(f"{req.bucket_id}_*.png"):
+        f.unlink(missing_ok=True)
+
+    loop = asyncio.get_running_loop()
+    masks = await loop.run_in_executor(
+        None, orchestrator.load_object_masks, bucket["object_mask_paths"])
+    new_regs = await loop.run_in_executor(
+        None, orchestrator.masks_to_regions, run, masks, bucket)
+
+    run["regions"] = [r for r in (run["regions"] or []) if r["bucket"] != req.bucket_id] + new_regs
+    run = await orchestrator.sync_run(app.state.db, run)
+    return {"regions": run["regions"], "grid": bucket.get("grid"), "region_mode": bucket["region_mode"]}
 
 
 class RegridRequest(BaseModel):

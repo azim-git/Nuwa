@@ -134,7 +134,7 @@
     "inputs": {
       "seed": 661568617231953,
       "steps": 8,
-      "cfg": 1,
+      "cfg": 3,
       "sampler_name": "res_multistep",
       "scheduler": "simple",
       "denoise": 1,
@@ -162,14 +162,15 @@
   },
   "652:42": {
     "inputs": {
-      "conditioning": [
-        "652:45",
+      "text": "blurry, glitch, color shift, discoloration, artifacts, watermark, text, low quality",
+      "clip": [
+        "652:39",
         0
       ]
     },
-    "class_type": "ConditioningZeroOut",
+    "class_type": "CLIPTextEncode",
     "_meta": {
-      "title": "ConditioningZeroOut"
+      "title": "CLIP Text Encode (Negative)"
     }
   },
   "652:45": {
@@ -187,7 +188,7 @@
   },
   "652:73": {
     "inputs": {
-      "strength": 0.3,
+      "strength": 0.15,
       "model": [
         "652:46",
         0

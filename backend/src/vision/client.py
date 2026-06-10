@@ -67,6 +67,64 @@ class VisionClient:
             None, lambda: subprocess.run(["ollama", "stop", self.model], capture_output=True))
         logger.info("vision model stopped")
 
+    def _prominence_sync(self, reference_path: str, output_path: str,
+                          defect_type: str, dataset_description: str) -> dict:
+        import ollama, io, base64
+        from PIL import Image
+        imgs_b64 = []
+        for p in (reference_path, output_path):
+            img = Image.open(p).convert("RGB")
+            if max(img.size) > 1024:
+                s = 1024 / max(img.size)
+                img = img.resize((int(img.width * s), int(img.height * s)))
+            buf = io.BytesIO(); img.save(buf, format="PNG")
+            imgs_b64.append(base64.b64encode(buf.getvalue()).decode())
+
+        prompt = (
+            f'Two images of {dataset_description}. Image 1 is the clean reference. '
+            f'Image 2 has a synthetic "{defect_type}" added somewhere.\n'
+            "Rate how VISIBLE the change is at a glance (not zoomed in):\n"
+            "5 = immediately obvious, 4 = noticeable within a second, "
+            "3 = visible if you look carefully, 2 = barely perceptible, "
+            "1 = invisible without pixel-level comparison.\n"
+            'Return ONLY JSON: {"rating": 3, "reason": "<one sentence>"}'
+        )
+        raw = ollama.chat(model=self.model,
+                          messages=[{"role": "user", "content": prompt, "images": imgs_b64}],
+                          options={"temperature": 0.1, "num_ctx": 4096},
+                          keep_alive=0, think=False)["message"]["content"]
+        clean = raw.strip()
+        if "</think>" in clean: clean = clean.split("</think>")[-1].strip()
+        if clean.startswith("```"):
+            clean = clean.split("```")[1]
+            if clean.startswith("json"): clean = clean[4:]
+        try:
+            d = json.loads(clean.strip())
+            rating = int(d.get("rating", 0))
+            if rating < 1 or rating > 5:
+                raise ValueError(f"rating {rating} out of range")
+            normalized = round((rating - 1) / 4, 4)
+            return {"prominence_raw": rating, "prominence_score": normalized,
+                    "prominence_reason": d.get("reason", "")}
+        except Exception:
+            return {"prominence_raw": 0, "prominence_score": 0.0,
+                    "prominence_reason": f"parse_error: {raw[:200]}"}
+
+    async def prominence(self, reference_path: str, output_path: str,
+                         defect_type: str, dataset_description: str) -> dict:
+        loop = asyncio.get_running_loop()
+        for attempt in range(3):
+            try:
+                return await loop.run_in_executor(
+                    None, self._prominence_sync,
+                    reference_path, output_path, defect_type, dataset_description)
+            except Exception as e:
+                if attempt < 2 and "memory" in str(e).lower():
+                    logger.warning("vision prominence OOM, settling then retrying (%d)", attempt + 1)
+                    await asyncio.sleep(3)
+                    continue
+                raise
+
     def _describe_sync(self, image_path: str) -> str:
         import ollama, io, base64
         from PIL import Image

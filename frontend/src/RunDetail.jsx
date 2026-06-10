@@ -1,24 +1,29 @@
 // src/RunDetail.jsx
-import { useEffect, useState } from "react"
+import { useEffect, useState, useCallback } from "react"
 import { useRunStream } from "./useRunStream"
-import { getRun, getSource, detect, approveMask, abortRun, decideCandidate, exportRun, exportDownloadUrl, regrid, BASE_URL } from "./api"
+import { getRun, getSource, getCandidates, detect, approveMask, abortRun, decideCandidate, exportRun, exportDownloadUrl, regrid, remode, BASE_URL } from "./api"
 
 export default function RunDetail({ runId, onBack }) {
   const { snapshot, connected } = useRunStream(runId)
   const [config, setConfig] = useState(null)   // setup data the loop never touches
+  const [regions, setRegions] = useState([])   // flat region list for bbox overlays
   const [busy, setBusy] = useState(false)
   const [exportSummary, setExportSummary] = useState(null)   // from the export POST response
 
+  const status = snapshot?.status
   useEffect(() => {
     if (!runId) return
-    getRun(runId).then((r) => setConfig(r.config)).catch(() => { })
-  }, [runId])
+    getRun(runId).then((r) => {
+      setConfig(r.config)
+      setRegions(r.regions || [])
+    }).catch(() => { })
+  }, [runId, status])
 
   if (!snapshot) {
     return <div className="muted">{connected ? "waiting for first snapshot…" : "connecting…"}</div>
   }
 
-  const { status, progress, candidates } = snapshot
+  const { progress, candidates } = snapshot
   const goal = progress.phase === "pilot" ? progress.pilot_target : progress.target
   const reviewCandidate = candidates.find((c) => c.status === "awaiting_review") || null
 
@@ -57,6 +62,7 @@ export default function RunDetail({ runId, onBack }) {
         status={status} busy={busy} runId={runId}
         reviewCandidate={reviewCandidate}
         exportSummary={exportSummary}
+        regions={regions}
         onDetect={() => cmd(() => detect(runId))}
         onApproveSubset={(ids, disabled) => cmd(() => approveMask(runId, ids, disabled || []))}
         onAbort={() => cmd(() => abortRun(runId))}
@@ -65,7 +71,7 @@ export default function RunDetail({ runId, onBack }) {
           reviewCandidate && cmd(() => decideCandidate(reviewCandidate.id, decision, reason))}
       />
 
-      <CandidateFeed candidates={candidates} />
+      <CandidateFeed candidates={candidates} runId={runId} regions={regions} />
     </div>
   )
 }
@@ -87,7 +93,7 @@ function ProgressBar({ accepted, rejected, goal, phase }) {
   )
 }
 
-function StatusGate({ status, busy, runId, reviewCandidate, exportSummary, onDetect, onApproveSubset, onAbort, onExport, onDecide }) {
+function StatusGate({ status, busy, runId, reviewCandidate, exportSummary, regions, onDetect, onApproveSubset, onAbort, onExport, onDecide }) {
   switch (status) {
     case "draft":
       return <button className="btn-primary" disabled={busy} onClick={onDetect}>
@@ -99,7 +105,7 @@ function StatusGate({ status, busy, runId, reviewCandidate, exportSummary, onDet
       return <button className="link" disabled={busy} onClick={onAbort}>
         {busy ? "aborting…" : "abort run"}</button>
     case "awaiting_pilot_review":
-      return <PilotReviewCard candidate={reviewCandidate} busy={busy} onDecide={onDecide} />
+      return <PilotReviewCard candidate={reviewCandidate} busy={busy} onDecide={onDecide} regions={regions} />
     case "consolidating":
       return <div className="muted">distilling guidance from the pilot… (auto-advances)</div>
     case "awaiting_export":
@@ -111,10 +117,16 @@ function StatusGate({ status, busy, runId, reviewCandidate, exportSummary, onDet
           <button className="btn-primary" disabled={busy} onClick={onExport}>
             {busy ? "packaging…" : "package dataset (COCO)"}
           </button>
+          <GalleryView runId={runId} regions={regions} />
         </div>
       )
     case "completed":
-      return <ExportResult runId={runId} busy={busy} onExport={onExport} summary={exportSummary} />
+      return (
+        <div>
+          <ExportResult runId={runId} busy={busy} onExport={onExport} summary={exportSummary} />
+          <GalleryView runId={runId} regions={regions} />
+        </div>
+      )
     case "aborted":
     case "failed":
       return <div className="muted">run {status}.</div>
@@ -123,36 +135,90 @@ function StatusGate({ status, busy, runId, reviewCandidate, exportSummary, onDet
   }
 }
 
-function CandidateFeed({ candidates }) {
+function CandidateFeed({ candidates, runId, regions }) {
+  const [selected, setSelected] = useState(null)
+  const [filter, setFilter] = useState(null)
+
   if (!candidates?.length) return <div className="muted">no candidates yet.</div>
+
   const ordered = [...candidates].reverse()   // newest first
+  const defectTypes = [...new Set(ordered.map((c) => c.defect_type))].sort()
+  const filtered = filter ? ordered.filter((c) => c.defect_type === filter) : ordered
+
+  const regionMap = {}
+  for (const r of (regions || [])) regionMap[r.id] = r
+
+  function thumb(c) {
+    const hasOutput = c.artifacts?.output_path
+    const url = hasOutput ? `${BASE_URL}/runs/${c.run_id}/candidates/${c.id}/artifact/output` : null
+
+    if (c.status === "generating") return <div className="cand-thumb-loading" />
+    if (!hasOutput) {
+      if (c.status === "failed") return <div className="cand-thumb-failed" />
+      return <div className="cand-thumb-placeholder" />
+    }
+    return <img className="cand-thumb" src={url} alt={c.defect_type} loading="lazy"
+      onClick={(e) => { e.stopPropagation(); setSelected(c) }} />
+  }
+
   return (
     <div className="cand-feed" style={{ marginTop: 12 }}>
-      {ordered.map((c) => (
-        <div key={c.id} style={{
-          display: "flex", gap: 12, alignItems: "center",
-          padding: "8px 0", borderBottom: "1px solid #f0f0f0", fontSize: 13,
-        }}>
-          <span className="badge">{c.status}</span>
-          <span style={{ fontWeight: 500 }}>{c.defect_type}</span>
-          <span className="muted">{c.region_ids?.length ?? 0} region(s) · {c.phase}</span>
-          {c.evaluation && (
-            <span className="muted" style={{ marginLeft: "auto" }}>
-              diff {c.evaluation.diff_score} · vis {c.evaluation.vision_score} · ∑ {c.evaluation.combined_score}
-            </span>
-          )}
+      {defectTypes.length > 1 && (
+        <div className="gallery-filters" style={{ marginBottom: 8 }}>
+          <button className={filter === null ? "active" : ""} onClick={() => setFilter(null)}>
+            all ({ordered.length})
+          </button>
+          {defectTypes.map((d) => (
+            <button key={d} className={filter === d ? "active" : ""} onClick={() => setFilter(d)}>
+              {d} ({ordered.filter((c) => c.defect_type === d).length})
+            </button>
+          ))}
         </div>
-      ))}
+      )}
+      {filtered.map((c) => {
+        const hasOutput = c.artifacts?.output_path
+        return (
+          <div key={c.id} className={`cand-row${hasOutput ? " clickable" : ""}`}
+            onClick={() => hasOutput && setSelected(c)}>
+            {thumb(c)}
+            <span className="badge">{c.status}</span>
+            <span style={{ fontWeight: 500 }}>{c.defect_type}</span>
+            <span className="muted">{c.region_ids?.length ?? 0} region(s) · {c.phase}</span>
+            {c.evaluation && (
+              <span className="muted" style={{ marginLeft: "auto" }}>
+                diff {c.evaluation.diff_score} · vis {c.evaluation.vision_score} · ∑ {c.evaluation.combined_score}
+              </span>
+            )}
+          </div>
+        )
+      })}
+      {selected && (
+        <Lightbox
+          candidate={selected}
+          candidates={filtered.filter((c) => c.artifacts?.output_path)}
+          regionMap={regionMap}
+          onClose={() => setSelected(null)}
+          onNav={(c) => setSelected(c)}
+        />
+      )}
     </div>
   )
 }
 
-function PilotReviewCard({ candidate, busy, onDecide }) {
+function PilotReviewCard({ candidate, busy, onDecide, regions }) {
   const [reason, setReason] = useState("")
+  const [overlay, setOverlay] = useState(null)   // null | "original" | "highlight"
+  const [imgSize, setImgSize] = useState(null)   // { w, h } natural size for bbox scaling
   if (!candidate) return <div className="muted">no candidate awaiting review.</div>
 
   const ev = candidate.evaluation
   const canReject = reason.trim().length > 0
+  const outputUrl = `${BASE_URL}/runs/${candidate.run_id}/candidates/${candidate.id}/artifact/output`
+  const sourceUrl = `${BASE_URL}/runs/${candidate.run_id}/candidates/${candidate.id}/artifact/source`
+
+  const regionMap = {}
+  for (const r of (regions || [])) regionMap[r.id] = r
+  const candRegions = (candidate.region_ids || []).map((id) => regionMap[id]).filter(Boolean)
 
   return (
     <div className="review-card" style={{ border: "1.5px solid #111", padding: 16, marginTop: 12 }}>
@@ -163,14 +229,49 @@ function PilotReviewCard({ candidate, busy, onDecide }) {
       </div>
 
       {candidate.artifacts?.output_path ? (
-        <img
-          src={`${BASE_URL}/runs/${candidate.run_id}/candidates/${candidate.id}/artifact/output`}
-          alt="generated defect candidate"
-          style={{
-            width: "100%", objectFit: "contain", maxHeight: "360px", 
-            margin: "12px 0", borderRadius: 6, background: "#f4f4f4"
-          }}
-        />
+        <div style={{ margin: "12px 0" }}>
+          <img src={outputUrl} alt="" style={{ display: "none" }}
+            onLoad={(e) => {
+              if (!imgSize) setImgSize({ w: e.target.naturalWidth, h: e.target.naturalHeight })
+            }} />
+          {imgSize ? (
+            <svg viewBox={`0 0 ${imgSize.w} ${imgSize.h}`}
+              style={{ width: "100%", maxHeight: 360, borderRadius: 6, background: "#f4f4f4" }}>
+              <image href={overlay === "original" ? sourceUrl : outputUrl}
+                x="0" y="0" width={imgSize.w} height={imgSize.h} />
+              {overlay === "highlight" && candRegions.map((r) => {
+                const [x, y, w, h] = r.bbox
+                return (
+                  <g key={r.id}>
+                    <rect x={x} y={y} width={w} height={h}
+                      fill="rgba(255,0,0,0.15)" stroke="#ff2222" strokeWidth={3} />
+                    <rect x={x} y={Math.max(0, y - 18)} width={r.id.length * 8 + 8} height={16}
+                      rx={3} fill="rgba(200,0,0,0.8)" />
+                    <text x={x + 4} y={Math.max(12, y - 5)} fontSize="11" fontWeight="bold"
+                      fill="#fff">{r.id}</text>
+                  </g>
+                )
+              })}
+            </svg>
+          ) : (
+            <div style={{ height: 220, background: "#f4f4f4", borderRadius: 6,
+                          display: "grid", placeItems: "center" }}>
+              <span className="muted">loading…</span>
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+            <button className="link" style={{ fontSize: 12 }}
+              onMouseEnter={() => setOverlay("original")}
+              onMouseLeave={() => setOverlay(null)}>
+              view original
+            </button>
+            <button className="link" style={{ fontSize: 12 }}
+              onMouseEnter={() => setOverlay("highlight")}
+              onMouseLeave={() => setOverlay(null)}>
+              highlight defects
+            </button>
+          </div>
+        </div>
       ) : (
         <div className="muted" style={{
           height: 220, margin: "12px 0", borderRadius: 6,
@@ -231,6 +332,8 @@ function MaskReviewCard({ runId, busy, onApprove }) {
   const [disabledDefects, setDisabledDefects] = useState(new Set())
   const [bucketGrids, setBucketGrids] = useState({})      // {bucket_id: N}
   const [bucketRegridding, setBucketRegridding] = useState({})
+  const [bucketModes, setBucketModes] = useState({})      // {bucket_id: "instance"|"subdivide"}
+  const [bucketRemoding, setBucketRemoding] = useState({})
 
   useEffect(() => {
     getRun(runId).then(async (r) => {
@@ -244,6 +347,7 @@ function MaskReviewCard({ runId, busy, onApprove }) {
       setDisabledDefects(new Set(Object.entries(feas)
         .filter(([, v]) => !v.feasible).map(([k]) => k)))
       setBucketGrids(Object.fromEntries(bkts.map((b) => [b.id, b.grid?.rows || 3])))
+      setBucketModes(Object.fromEntries(bkts.map((b) => [b.id, b.region_mode || "instance"])))
       const srcId = r.config?.source_image_ids?.[0]
       if (srcId) {
         const meta = await getSource(srcId)
@@ -263,6 +367,24 @@ function MaskReviewCard({ runId, busy, onApprove }) {
       setRegions(newRegs)
     } catch { /* keep current */ } finally {
       setBucketRegridding((p) => ({ ...p, [bucketId]: false }))
+    }
+  }
+
+  async function commitRemode(bucketId, mode) {
+    setBucketRemoding((p) => ({ ...p, [bucketId]: true }))
+    setBucketModes((p) => ({ ...p, [bucketId]: mode }))
+    try {
+      const grid = mode === "subdivide" ? { rows: bucketGrids[bucketId] || 3, cols: bucketGrids[bucketId] || 3 } : undefined
+      const res = await remode(runId, bucketId, mode, grid)
+      const newRegs = res.regions
+      const oldIds = new Set((regions || []).filter((r) => r.bucket === bucketId).map((r) => r.id))
+      const newIds = new Set(newRegs.filter((r) => r.bucket === bucketId).map((r) => r.id))
+      setKept((p) => { const n = new Set([...p].filter((id) => !oldIds.has(id))); newIds.forEach((id) => n.add(id)); return n })
+      setRegions(newRegs)
+      // update buckets state to reflect new mode
+      setBuckets((prev) => prev.map((b) => b.id === bucketId ? { ...b, region_mode: mode, grid: res.grid } : b))
+    } catch { /* keep current */ } finally {
+      setBucketRemoding((p) => ({ ...p, [bucketId]: false }))
     }
   }
 
@@ -344,7 +466,26 @@ function MaskReviewCard({ runId, busy, onApprove }) {
                   {b.skipped && (
                     <div style={{ fontSize: 10, color: "#999", marginTop: 4 }}>{b.skipped}</div>
                   )}
-                  {b.region_mode === "subdivide" && !b.skipped && (
+                  {b.infeasible_warning && (
+                    <div style={{ fontSize: 10, color: "#c80", marginTop: 4 }}>⚠ {b.infeasible_warning}</div>
+                  )}
+                  <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+                    {["instance", "subdivide"].map((m) => (
+                      <button key={m} disabled={bucketRemoding[b.id] || busy}
+                        onClick={() => { if ((bucketModes[b.id] || b.region_mode) !== m) commitRemode(b.id, m) }}
+                        style={{
+                          fontSize: 10, padding: "2px 8px", borderRadius: 4, cursor: "pointer",
+                          border: (bucketModes[b.id] || b.region_mode) === m ? `2px solid ${col}` : "1px solid #ccc",
+                          background: (bucketModes[b.id] || b.region_mode) === m ? `${col}25` : "#fff",
+                          fontWeight: (bucketModes[b.id] || b.region_mode) === m ? 700 : 400,
+                          color: (bucketModes[b.id] || b.region_mode) === m ? col : "#666",
+                        }}>
+                        {m}
+                      </button>
+                    ))}
+                    {bucketRemoding[b.id] && <span className="muted" style={{ fontSize: 10 }}>switching…</span>}
+                  </div>
+                  {(bucketModes[b.id] || b.region_mode) === "subdivide" && !b.skipped && (
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
                       <span style={{ color: "#555", whiteSpace: "nowrap", fontSize: 11 }}>
                         {bucketGrids[b.id] || 3}×{bucketGrids[b.id] || 3}
@@ -406,6 +547,157 @@ function MaskReviewCard({ runId, busy, onApprove }) {
         onClick={() => onApprove(keptVisible, [...disabledDefects])}>
         {busy ? "approving…" : `approve ${keptVisible.length} region(s) → start pilot`}
       </button>
+    </div>
+  )
+}
+
+function GalleryView({ runId, regions }) {
+  const [candidates, setCandidates] = useState(null)
+  const [filter, setFilter] = useState(null)       // null = all, string = defect type
+  const [selected, setSelected] = useState(null)    // candidate for lightbox
+
+  useEffect(() => {
+    getCandidates(runId).then((all) => {
+      const accepted = all.filter((c) => c.status === "accepted" && c.artifacts?.output_path)
+      setCandidates(accepted.reverse())   // newest first
+    }).catch(() => setCandidates([]))
+  }, [runId])
+
+  if (candidates === null) return <div className="muted">loading gallery...</div>
+  if (candidates.length === 0) return <div className="muted">no accepted candidates to display.</div>
+
+  const defectTypes = [...new Set(candidates.map((c) => c.defect_type))].sort()
+  const filtered = filter ? candidates.filter((c) => c.defect_type === filter) : candidates
+
+  const regionMap = {}
+  for (const r of (regions || [])) regionMap[r.id] = r
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div className="gallery-filters">
+        <button className={filter === null ? "active" : ""} onClick={() => setFilter(null)}>
+          all ({candidates.length})
+        </button>
+        {defectTypes.map((d) => (
+          <button key={d} className={filter === d ? "active" : ""} onClick={() => setFilter(d)}>
+            {d} ({candidates.filter((c) => c.defect_type === d).length})
+          </button>
+        ))}
+      </div>
+      <div className="gallery-grid">
+        {filtered.map((c) => {
+          const url = `${BASE_URL}/runs/${c.run_id}/candidates/${c.id}/artifact/output`
+          return (
+            <div key={c.id} className="gallery-cell" onClick={() => setSelected(c)}>
+              <img src={url} alt={c.defect_type} loading="lazy" />
+              <div className="gallery-label">{c.defect_type}</div>
+            </div>
+          )
+        })}
+      </div>
+      {selected && (
+        <Lightbox
+          candidate={selected}
+          candidates={filtered}
+          regionMap={regionMap}
+          onClose={() => setSelected(null)}
+          onNav={(c) => setSelected(c)}
+        />
+      )}
+    </div>
+  )
+}
+
+function Lightbox({ candidate, candidates, regionMap, onClose, onNav }) {
+  const [overlay, setOverlay] = useState(null)   // null | "original" | "highlight"
+  const [imgSize, setImgSize] = useState(null)
+
+  const idx = candidates.indexOf(candidate)
+  const prev = idx > 0 ? candidates[idx - 1] : null
+  const next = idx < candidates.length - 1 ? candidates[idx + 1] : null
+
+  const handleKey = useCallback((e) => {
+    if (e.key === "Escape") onClose()
+    else if (e.key === "ArrowLeft" && prev) { setImgSize(null); setOverlay(null); onNav(prev) }
+    else if (e.key === "ArrowRight" && next) { setImgSize(null); setOverlay(null); onNav(next) }
+  }, [onClose, onNav, prev, next])
+
+  useEffect(() => {
+    window.addEventListener("keydown", handleKey)
+    return () => window.removeEventListener("keydown", handleKey)
+  }, [handleKey])
+
+  // reset imgSize when candidate changes
+  useEffect(() => { setImgSize(null); setOverlay(null) }, [candidate.id])
+
+  const outputUrl = `${BASE_URL}/runs/${candidate.run_id}/candidates/${candidate.id}/artifact/output`
+  const sourceUrl = `${BASE_URL}/runs/${candidate.run_id}/candidates/${candidate.id}/artifact/source`
+  // Prefer region data from regionMap; fall back to candidate labels (which carry bboxes directly)
+  const fromRegions = (candidate.region_ids || []).map((id) => regionMap[id]).filter(Boolean)
+  const candRegions = fromRegions.length > 0
+    ? fromRegions
+    : (candidate.labels || []).map((l, i) => ({ id: `${l.category}_${i}`, bbox: l.bbox }))
+  const ev = candidate.evaluation
+
+  return (
+    <div className="lightbox-backdrop" onClick={(e) => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="lightbox-content">
+        {prev && <button className="lightbox-nav prev" onClick={() => { setImgSize(null); setOverlay(null); onNav(prev) }}>&lsaquo;</button>}
+        {next && <button className="lightbox-nav next" onClick={() => { setImgSize(null); setOverlay(null); onNav(next) }}>&rsaquo;</button>}
+
+        <img src={outputUrl} alt="" style={{ display: "none" }}
+          onLoad={(e) => { if (!imgSize) setImgSize({ w: e.target.naturalWidth, h: e.target.naturalHeight }) }} />
+
+        {imgSize ? (
+          <svg viewBox={`0 0 ${imgSize.w} ${imgSize.h}`}>
+            <image href={overlay === "original" ? sourceUrl : outputUrl}
+              x="0" y="0" width={imgSize.w} height={imgSize.h} />
+            {overlay === "highlight" && candRegions.map((r) => {
+              const [x, y, w, h] = r.bbox
+              return (
+                <g key={r.id}>
+                  <rect x={x} y={y} width={w} height={h}
+                    fill="rgba(255,0,0,0.15)" stroke="#ff2222" strokeWidth={3} />
+                  <rect x={x} y={Math.max(0, y - 18)} width={r.id.length * 8 + 8} height={16}
+                    rx={3} fill="rgba(200,0,0,0.8)" />
+                  <text x={x + 4} y={Math.max(12, y - 5)} fontSize="11" fontWeight="bold"
+                    fill="#fff">{r.id}</text>
+                </g>
+              )
+            })}
+          </svg>
+        ) : (
+          <div style={{ width: 400, height: 300, background: "rgba(255,255,255,0.05)",
+                        borderRadius: 8, display: "grid", placeItems: "center" }}>
+            <span style={{ color: "#888" }}>loading...</span>
+          </div>
+        )}
+
+        <div className="lightbox-actions">
+          <button onMouseEnter={() => setOverlay("original")} onMouseLeave={() => setOverlay(null)}>
+            view original
+          </button>
+          <button onMouseEnter={() => setOverlay("highlight")} onMouseLeave={() => setOverlay(null)}>
+            highlight defects
+          </button>
+        </div>
+
+        <div className="lightbox-meta">
+          <strong>{candidate.defect_type}</strong>
+          <span style={{ margin: "0 8px" }}>&middot;</span>
+          {candidate.region_ids?.length ?? 0} region(s)
+          {ev && (
+            <span>
+              <span style={{ margin: "0 8px" }}>&middot;</span>
+              diff {ev.diff_score} &middot; vision {ev.vision_score} &middot; combined {ev.combined_score}
+            </span>
+          )}
+          <div style={{ fontSize: 11, marginTop: 4, opacity: 0.7 }}>
+            {idx + 1} / {candidates.length}
+            {candidate.prompt && <span> &middot; {candidate.prompt}</span>}
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
